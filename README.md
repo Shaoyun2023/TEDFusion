@@ -1,2 +1,4 @@
 # TEDFusion
-Text-Driven Fusion for Infrared and Visible Images: Achieving Image Scene Adaptation on Hyperbolic Space (ICML 2026)
+Text-Driven Fusion for Infrared and Visible Images: Achieving Image Scene Adaptation on Hyperbolic Space
+====
+Accetped by [IJCV 2025]
