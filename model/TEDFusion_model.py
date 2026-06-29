@@ -12,19 +12,152 @@ from prompt_toolkit.filters import has_arg
 from sympy.physics.units import percent
 from tensorboard.compat.tensorflow_stub.dtypes import float64
 
+from GmSa.grassmann import FRMap, QRComposition,QR, Projmap, Orthmap,Orthmap2, OrthmapFunction, ProjPoolLayer, ProjPoolLayer_A
+from GmSa.GSMA import E2R,E2R2 ,AttentionManifold
 from args_fusion import args
 from scipy.spatial.distance import jensenshannon
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import numpy as np
+
 
 from sklearn.decomposition import PCA
 
 
 def hyperbolic_projection(x):
+    """极简双曲投影：x -> x / (||x|| + 1) 模拟庞加莱球"""
     return x / (x.norm(dim=-1, keepdim=True) + 1)
 
 
+def visualize_crossmodal_similarity(img1,img2, text1,text2, title):
+    image = torch.sum(img2, dim=0, keepdim=True)
+    image = torch.sum(image, dim=1, keepdim=True)
+
+    image = image.squeeze().detach().cpu().numpy()
+
+    image = (image - image.min()) / (image.max() - image.min())
+    plt.imshow(image, cmap='jet')
+    plt.axis('off')
+    plt.show()
+    """
+    可视化图像局部区域与文本特征的相似度热力图
+    img_feat: [2, 384, 12, 12] 图像特征
+    text_feat: [2, 384, 1, 1] 文本特征
+    title: 图像标题
+    """
+    hh = img1.shape[2]
+    # 将文本特征展平为[2, 384]
+    text1 = text1.squeeze(-1).squeeze(-1)  # [2, 384]
+    text2 = text2.squeeze(-1).squeeze(-1)  # [2, 384]
+
+    # 计算欧式空间相似度（余弦相似度）
+    img1 = img1.flatten(2).permute(0, 2, 1)  # [2, 144, 384]
+    img2 = img2.flatten(2).permute(0, 2, 1)  # [2, 144, 384]
+    # print(img1.shape,"img1")
+    # print(text1.shape,"text1")
+    euclidean_sim = F.cosine_similarity(img1, text1.unsqueeze(1), dim=-1)  # [2, 144]
+
+    # 计算双曲空间相似度（负距离）
+
+    c1 = torch.tensor(0.1, device=img2.device, dtype=img2.dtype)
+    c1 = torch.clamp_min(c1, 1e-8)
+
+    c2 = torch.tensor(0.1, device=text2.device, dtype=text2.dtype)
+    c2 = torch.clamp_min(c2, 1e-8)
+
+    # img2 = safe_project(img2,c1)
+    # text2 = safe_project(text2,c2)
+
+    # print(img2,"img")
+    # print(text2,"text")
+    hyperbolic_sim = F.cosine_similarity(img2, text2.unsqueeze(1),dim=-1)  # [2, 144]
+
+    # 调整形状为[2, 12, 12]
+    euclidean_sim = euclidean_sim.view(2, hh,hh)
+    hyperbolic_sim = hyperbolic_sim.view(2, hh,hh)
+
+    # 可视化
+    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+
+    for i in range(2):
+        # 欧式空间相似度热力图
+        axes[0, i].imshow(euclidean_sim[i].detach().cpu().numpy(), cmap='viridis')
+        axes[0, i].set_title(f"样本{i} - 欧式空间相似度")
+        axes[0, i].axis('off')
+
+        # 双曲空间相似度热力图
+        axes[1, i].imshow(hyperbolic_sim[i].detach().cpu().numpy(), cmap='viridis')
+        axes[1, i].set_title(f"样本{i} - 双曲空间相似度")
+        axes[1, i].axis('off')
+
+    plt.suptitle(title, fontsize=14)
+    plt.tight_layout()
+    plt.show()
+
+    # 打印统计信息
+    print(f"欧式空间相似度范围: [{euclidean_sim.min():.3f}, {euclidean_sim.max():.3f}]")
+    print(f"双曲空间相似度范围: [{hyperbolic_sim.min():.3f}, {hyperbolic_sim.max():.3f}]")
+    print(f"双曲空间相似度方差: {hyperbolic_sim.var():.3f} (通常更高，表示更清晰的关联)")
+
+
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+import numpy as np
+
+
+def perform_sensitivity_analysis(h_attr, h_text):
+    """
+    灵敏度分析：计算不同 dropout 概率下，融合特征与原始文本特征的偏离程度
+    """
+    probs = np.linspace(0, 1, 11)  # 0.0, 0.1, ..., 1.0
+    distances = []
+    cos_sims = []
+
+    # 转换到同一维度进行对比 (假设对比第一个分支 h_text11)
+    # 为了简化，我们观察 mask 逻辑对特征分布的影响
+    with torch.no_grad():
+        for p in probs:
+            # 模拟多次随机实验取平均值
+            temp_dist = []
+            temp_sim = []
+            for _ in range(100):
+                mask = (torch.rand(h_text.size(0), 1).to(h_text.device) < p).float()
+                # 模拟 forward 中的融合逻辑
+                h_fused = mask * h_attr + (1 - mask) * h_text
+
+                # 计算欧式距离 (数值稳定性)
+                dist = torch.norm(h_fused - h_text, p=2, dim=1).mean().item()
+                # 计算余弦相似度 (语义一致性)
+                sim = F.cosine_similarity(h_fused, h_text).mean().item()
+
+                temp_dist.append(dist)
+                temp_sim.append(sim)
+
+            distances.append(np.mean(temp_dist))
+            cos_sims.append(np.mean(temp_sim))
+
+    # --- 可视化部分 ---
+    fig, ax1 = plt.subplots(figsize=(8, 5))
+
+    color = 'tab:red'
+    ax1.set_xlabel('Dropout Probability (p)')
+    ax1.set_ylabel('L2 Distance (Deviation)', color=color)
+    ax1.plot(probs, distances, marker='o', color=color, label='L2 Distance')
+    ax1.tick_params(axis='y', labelcolor=color)
+    ax1.grid(True, alpha=0.3)
+
+    ax2 = ax1.twinx()
+    color = 'tab:blue'
+    ax2.set_ylabel('Cosine Similarity (Consistency)', color=color)
+    ax2.plot(probs, cos_sims, marker='s', color=color, label='Cosine Similarity')
+    ax2.tick_params(axis='y', labelcolor=color)
+
+    # 标注我们的设置 0.3
+    plt.axvline(x=0.3, color='green', linestyle='--', label='Selected p=0.3')
+
+    plt.title('Sensitivity Analysis of Text Dropout Rate')
+    fig.tight_layout()
+    plt.show()
+
+    # 返回数值用于日志记录
+    return dict(zip(probs.round(2), cos_sims))
 
 
 def poincare_distance(u, v):
@@ -227,6 +360,7 @@ class FeatureWiseAffine(nn.Module):
         return scale * y
 
     def forward(self, x, text_embed):
+
         b_image, c_image, w, h = x.shape
 
         patch_size = 12
@@ -239,16 +373,15 @@ class FeatureWiseAffine(nn.Module):
             if x.shape[3] % 10 == 0:
                 patch_size = 10
 
-
+        image_patches_E = x
 
         image_patches = x
 
-
         b_I, c_I, np_I, p2_I = image_patches.shape
-
 
         image_patches = self.image_proj(image_patches.permute(0, 2, 3, 1))
         image_patches = image_patches.permute(0, 3, 1, 2)
+
 
         text_embed = text_embed.unsqueeze(1)
         batch = x.shape[0]
@@ -261,6 +394,8 @@ class FeatureWiseAffine(nn.Module):
             gamma_H = self.text_proj(gamma_E.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
             beta_H = self.text_proj(beta_E.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
             b_T, c_T = gamma_H.shape[0], gamma_H.shape[1]
+            # gamma_H = self.exp_map(gamma_H.view(b_T, c_T, -1).permute(0, 2, 1))
+            # beta_H = self.exp_map(beta_H.view(b_T, c_T, -1).permute(0, 2, 1))
 
             gamma_H = self.exp_map(gamma_H)
             image_patches = self.exp_map(image_patches)
@@ -269,6 +404,7 @@ class FeatureWiseAffine(nn.Module):
             image_patches = image_patches.view(b_I, c_I, -1)
 
             image_patches = self.mobius_translation(image_patches.permute(0, 2, 1), gamma_H, c=self.c)
+
             image_patches = image_patches.reshape(b_I, c_I, h, w)
 
             image_patches = image_patches.permute(0, 2, 3, 1)  # [2, 96, 96, 48]
@@ -276,15 +412,20 @@ class FeatureWiseAffine(nn.Module):
 
             # x = self.mobius_add(self.mobius_mul(gamma_H, image_patches, self.c), beta_H, self.c)
             gamma_H = gamma_H.view(b_T, c_T, -1).permute(0, 2, 1)
+
             distance = poincare_loss(image_patches, gamma_H)
 
             # 2. 恢复原始维度 [2, 9216, 48] -> [2, 48, 96, 96]
             x = image_patches.reshape(b_image, h, w, c_I)  # [2, 96, 96, 48]
             x = x.permute(0, 3, 1, 2)  # [2, 48, 96, 96]
 
+
             x = self.log_map(x)
 
+            gamma_H = gamma_H.permute(0, 2, 1).unsqueeze(3)
+
         return [x, distance]
+
 
 def print_euclidean_distances(features):
     """打印特征间的欧式距离矩阵"""
@@ -384,7 +525,7 @@ class PatchFlattener1(nn.Module):
 
 #
 
-class TEDFusion(nn.Module):
+class Text_IF(nn.Module):
     def __init__(self, model_clip, inp_A_channels=3, inp_B_channels=3, out_channels=3,
                  dim=48, num_blocks=[2, 2, 2, 2],
                  num_refinement_blocks=4,
@@ -394,7 +535,7 @@ class TEDFusion(nn.Module):
                  LayerNorm_type='WithBias',
                  ):
 
-        super(TEDFusion, self).__init__()
+        super(Text_IF, self).__init__()
 
         self.model_clip = model_clip
         self.model_clip.eval()
@@ -459,8 +600,17 @@ class TEDFusion(nn.Module):
 
         self.isss = 0
 
+        # self.fc1 = nn.Linear(8, 16)
+        # self.fc2 = nn.Linear(16, 4)
+
         self.fc1 = nn.Linear(8, 16)
         self.fc2 = nn.Linear(16, 4)
+
+        # self.MLP = nn.Sequential(
+        #     nn.Linear(4, 4 * 2),
+        #     nn.LeakyReLU(),
+        #     nn.Linear(4 * 2, 4)
+        # )
 
 
         inp_channels = 1
@@ -557,7 +707,6 @@ class TEDFusion(nn.Module):
             # 生成伯努利掩码 [B,1]
             mask = (torch.rand_like(h_text[:, :1]) < self.drop_prob).float()
 
-            # 重要！保持梯度传播路径（不能用原地操作）
             h_text11 = mask * h_attr1 + (1 - mask) * h_text  # [B, text_dim]
             h_text22 = mask * h_attr2 + (1 - mask) * h_text  # [B, text_dim]
             h_text33 = mask * h_attr3 + (1 - mask) * h_text  # [B, text_dim]
@@ -591,11 +740,11 @@ class TEDFusion(nn.Module):
         # 残差融合
         fused4 = h_attr4 * gate4 + h_text * (1 - gate4)
 
+
         fused = torch.cat([fused1,fused2,fused3,fused4],dim=1)
         fusedd = fused1 + fused2 + fused3 + fused4
 
         self.isss = self.isss + 1
-
         h_texttt = torch.cat([h_text, h_text,h_text,h_text], dim=1)
 
         x4_A, x3_A, x2_A, x1_A = self.encoder_A(inp_img_A) #4:[384,12,12] 3:[192,24,24] 2:[96,48,48] 1:[48,96,96]
@@ -667,7 +816,7 @@ class TEDFusion(nn.Module):
         text_feature = self.model_clip.encode_text(text)
         return text_feature
 
-class TEDFusion1(nn.Module):
+class Text_IF1(nn.Module):
     def __init__(self, model_clip, inp_A_channels=3, inp_B_channels=3, out_channels=3,
                  dim=48, num_blocks=[2, 2, 2, 2],
                  num_refinement_blocks=4,
@@ -677,7 +826,7 @@ class TEDFusion1(nn.Module):
                  LayerNorm_type='WithBias',
                  ):
 
-        super(TEDFusion1, self).__init__()
+        super(Text_IF1, self).__init__()
         # self.dummy_text = nn.Parameter(torch.randn(1, 64))
         self.model_clip = model_clip
         self.model_clip.eval()
@@ -777,11 +926,6 @@ class TEDFusion1(nn.Module):
         self.attr_proj4 = nn.Linear(2, 64)
         self.attr_proj5 = nn.Linear(1, 256)
 
-        # self.attr_proj1 = nn.Linear(2, 256)
-        # self.attr_proj2 = nn.Linear(2, 256)
-        # self.attr_proj3 = nn.Linear(2, 256)
-        # self.attr_proj4 = nn.Linear(2, 256)
-        # self.attr_proj5 = nn.Linear(1, 256)
         # 文本语义映射网络
         self.text_proj = nn.Linear(154, 256)
         # 动态门控融合器
@@ -798,7 +942,7 @@ class TEDFusion1(nn.Module):
         self.text_proj22 = nn.Linear(512, 32)
         # self.text_proj21 = nn.Linear(512, 128)
         # self.text_proj22 = nn.Linear(512, 128)
-        # self.conv48to384 = nn.Conv2d(48, 384, kernel_size=3, stride=1, padding=1, bias=bias)
+        self.conv48to384 = nn.Conv2d(48, 384, kernel_size=3, stride=1, padding=1, bias=bias)
         self.is_training = 0
         self.temp_storage = []
         self.all_samples = []
@@ -806,27 +950,12 @@ class TEDFusion1(nn.Module):
 
     def forward(self, inp_img_A, inp_img_B,feature):
         b = inp_img_A.shape[0]
-        # text1 = text1.float()
-        # text2 = text2.float()
-        # text = text.mean(dim=0)
-
-        # feature = torch.relu(self.fc1(feature))
-        # feature = self.fc2(feature)
-        # feature = torch.sigmoid(feature)
 
         feature = feature.unsqueeze(0).expand(inp_img_A.size(0), -1)
         # print(feature)
 
         f1,f2,f3,f4 = feature.chunk(4, dim=1)
 
-        # print(f1, "fused1")
-        # print(f2, "fused2")
-        # print(f3, "fused3")
-        # print(f4, "fused4")
-
-
-
-        # print(f1.shape)
         # 属性特征映射
         h_attr1 = self.attr_proj1(f1).expand(b, -1)
         h_attr2 = self.attr_proj2(f2).expand(b, -1)
@@ -858,7 +987,6 @@ class TEDFusion1(nn.Module):
         fused4 = h_attr4 * gate4 + h_attr4 * (1 - gate4)
 
         fused = torch.cat([fused1,fused2,fused3,fused4],dim=1)
-        # fused = fused1 + fused2 + fused3 + fused4
 
         self.isss = self.isss + 1
 
@@ -874,20 +1002,14 @@ class TEDFusion1(nn.Module):
         x4_B = self.attention_spatial(x4_B)
         x4_A, x4_B = self.cross_attention(x4_A, x4_B)
         x4 = self.feature_fusion_4(x4_A, x4_B)
-        # x4 = self.attention_spatial(x4)
-        # print(fused.shape)
-
-        # x4 = self.prompt_guidance_4(x4, fused)
         inp4 = x4
         outd4 = self.decoder_level4(inp4)
-
         inp3 = self.up4_3(outd4)
         # inp3 = self.prompt_guidance_3(inp3, fused)
         x3 = self.feature_fusion_3(x3_A, x3_B)
         inp31 = torch.cat([inp3, x3], 1)
         inp31 = self.reduce_chan_level3(inp31)
         outd31 = self.decoder_level3(inp31)
-
         inp2 = self.up3_2(outd31)
         # inp2 = self.prompt_guidance_2(inp2, fused)
         x2 = self.feature_fusion_2(x2_A, x2_B)
@@ -895,27 +1017,20 @@ class TEDFusion1(nn.Module):
         inp22 = torch.cat([inp21,x2,inp2], 1)
         inp22 = self.reduce_chan_level2(inp22)
         outd22 = self.decoder_level2(inp22)
-
         inp1 = self.up2_1(outd22)
         # inp1 = self.prompt_guidance_1(inp1, fused)
         x1 = self.feature_fusion_1(x1_A, x1_B)
         inp11 = torch.cat([x1, self.up2_1(x2)], 1)
-
         inp12 = torch.cat([x1, inp11, self.up2_1_2(inp21)], 1)
         inp13 = torch.cat([x1, inp11, inp12, inp1], 1)
-
         inp13 = self.reduce_chan_level1(inp13)
-
         outd1 = self.decoder_level1(inp13)
-
         outd1 = self.refinement(outd1)
-
-
-
         outd1 = self.output1(outd1)
         outd1 = self.output2(outd1)
         outd1 = self.output3(outd1)
         outd1 = self.output4(outd1)
+
 
         return outd1
 
@@ -923,7 +1038,6 @@ class TEDFusion1(nn.Module):
     def get_text_feature(self, text):
         text_feature = self.model_clip.encode_text(text)
         return text_feature
-
 
 class Cross_attention(nn.Module):
     def __init__(self, in_channel, n_head=1, norm_groups=16):
@@ -1169,8 +1283,6 @@ class LayerNorm(nn.Module):
         return to_4d(self.body(to_3d(x)), h, w)
 
 
-##########################################################################
-## Gated-Dconv Feed-Forward Network (GDFN)
 class FeedForward(nn.Module):
     def __init__(self, dim, ffn_expansion_factor, bias):
         super(FeedForward, self).__init__()
@@ -1190,9 +1302,6 @@ class FeedForward(nn.Module):
         x = self.project_out(x)
         return x
 
-
-##########################################################################
-## Multi-DConv Head Transposed Self-Attention (MDTA)
 class Attention(nn.Module):
     def __init__(self, dim, num_heads, bias):
         super(Attention, self).__init__()
@@ -1227,7 +1336,6 @@ class Attention(nn.Module):
         return out
 
 
-##########################################################################
 class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type):
         super(TransformerBlock, self).__init__()
@@ -1242,9 +1350,6 @@ class TransformerBlock(nn.Module):
 
         return x
 
-
-##########################################################################
-## Overlapped image patch embedding with 3x3 Conv
 class OverlapPatchEmbed(nn.Module):
     def __init__(self, in_c=3, embed_dim=48, bias=False):
         super(OverlapPatchEmbed, self).__init__()
@@ -1254,9 +1359,6 @@ class OverlapPatchEmbed(nn.Module):
         x = self.proj(x)
         return x
 
-
-##########################################################################
-## Resizing modules
 class Downsample(nn.Module):
     def __init__(self, n_feat):
         super(Downsample, self).__init__()
