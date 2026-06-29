@@ -5,9 +5,9 @@ import cv2
 import clip.clip
 import torch
 from torchvision.transforms import functional as F
-
-from model.TEDFusion_model import TEDFusion1 as create_model1
-
+from model.TEDFusion_model import Text_IF as create_model
+from model.TEDFusion_model import Text_IF1 as create_model1
+# from model.Text_IF_model import Text_IF2 as create_model2
 
 import argparse
 
@@ -37,7 +37,7 @@ def main(args):
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     supported = [".jpg", ".JPG", ".png", ".PNG", ".bmp", 'tif', 'TIF']
-    # text_line = args.input_text
+    text_line = args.input_text
 
     visible_root = os.path.join(root_path, "Visible")
     infrared_root = os.path.join(root_path, "Infrared")
@@ -80,9 +80,6 @@ def main(args):
 
         new_height = (height // 16) * 16
 
-        # new_width = (width * 16.0) / 16.0
-        #
-        # new_height = (height * 16.0) / 16.0
 
 
         ir = ir.resize((new_height, new_width))
@@ -136,12 +133,19 @@ def main(args):
         feature = feature.float()
 
         with torch.no_grad():
-            # text = clip.tokenize(text_line).to(device)
-            # text1 = clip.tokenize(text_line[0]).to(device)
-            # text2 = clip.tokenize(text_line[1]).to(device)
-            # text3 = clip.tokenize(text_line[2]).to(device)
-            # text4 = clip.tokenize(text_line[3]).to(device)
-            i = model(vi, ir,feature)
+
+            shifts = [(0, 0), (0, 1), (1, 0), (1, 1)]  # 4个方向的1像素偏移
+            outputs = []
+
+            for dy, dx in shifts:
+                vi_shifted = torch.roll(vi, shifts=(dy, dx), dims=(2, 3))
+                ir_shifted = torch.roll(ir, shifts=(dy, dx), dims=(2, 3))
+                out = model(vi_shifted, ir_shifted, feature)
+                out_unshifted = torch.roll(out, shifts=(-dy, -dx), dims=(2, 3))
+                outputs.append(out_unshifted)
+
+            i = torch.stack(outputs).mean(dim=0)
+            # i = model(vi, ir,feature)
             text1 = torch.tensor(0)
             text2 = torch.tensor(0)
             # i = model(vi, ir, feature,text1,text2)
@@ -203,7 +207,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_path', type=str, required=True, help='test data root path')
     parser.add_argument('--weights_path', type=str, required=True, help='initial weights path')
     parser.add_argument('--save_path', type=str, default='./results', help='output save image path')
-    # parser.add_argument('--input_text', type=str, required=True, help='text control input')
+    parser.add_argument('--input_text', type=str, required=True, help='text control input')
 
     parser.add_argument('--device', default='cuda', help='device (i.e. cuda or cpu)')
     parser.add_argument('--gpu_id', default='0', help='device id (i.e. 0, 1, 2 or 3)')

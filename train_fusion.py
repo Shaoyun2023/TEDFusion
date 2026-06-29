@@ -9,7 +9,7 @@ import clip
 from data.prompt_dataset import PromptDataSet
 from data.simple_dataset import SimpleDataSet
 
-from model.TEDFusion_model import TEDFusion as create_model
+from model.TEDFusion_model import Text_IF as create_model
 from scripts.utils import read_data, train_one_epoch, evaluate, create_lr_scheduler
 import datetime
 import warnings
@@ -216,17 +216,17 @@ def main(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     # parser.add_argument('--epochs', type=int, default=120)
-    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--epochs', type=int, default=15)
 
     # set the appropriate batch-size value for your device
     # parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--lr', type=float, default=0.0001)
 
-    parser.add_argument('--low_light_path', type=str, default="./dataset/train_MSRS2")
-    parser.add_argument('--over_exposure_path', type=str, default="./dataset/train_MSRS2")
-    parser.add_argument('--ir_low_contrast_path', type=str, default="./dataset/train_MSRS2")
-    parser.add_argument('--ir_noise_path', type=str, default="./dataset/train_MSRS2")
+    parser.add_argument('--low_light_path', type=str, default="./dataset/train_MSRS")
+    parser.add_argument('--over_exposure_path', type=str, default="./dataset/train_MSRS")
+    parser.add_argument('--ir_low_contrast_path', type=str, default="./dataset/train_MSRS")
+    parser.add_argument('--ir_noise_path', type=str, default="./dataset/train_MSRS")
 
     parser.add_argument('--weights', type=str, default='',
                         help='initial weights path')
