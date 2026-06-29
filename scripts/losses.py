@@ -6,7 +6,7 @@ from metric.Metric import *
 from PIL import Image
 
 import matplotlib.pyplot as plt
-import pandas as pd # 用于生成表格
+
 
 class fusion_prompt_loss(nn.Module):
     def __init__(self):
@@ -16,17 +16,6 @@ class fusion_prompt_loss(nn.Module):
         self.has_analyzed = False  # 添加一个开关
 
     def forward(self, image_A, image_B, image_fused, htext, hattr, distance_all, task):
-        # image = torch.sum(image_fused, dim=1, keepdim=True)
-        # AG = AG_function_torch(image_fused)
-
-        # image = torch.sum(image_A, dim=1, keepdim=True)
-        # image = image.squeeze().detach().cpu().numpy()
-        #
-        # image = (image - image.min()) / (image.max() - image.min())
-        # plt.imshow(image, cmap='gray')
-        # plt.axis('off')
-        # plt.show()
-
         total_loss = 0
         total_ssim_loss = 0
         total_max_loss = 0
@@ -34,13 +23,6 @@ class fusion_prompt_loss(nn.Module):
         total_grad_loss = 0
         total_semantic_loss = 0
         total_hyperbolic_loss = 0
-
-        # loss, ssim_loss, max_loss, color_loss, grad_loss = self.fusion_loss(self.get_images(image_A), self.get_images(image_B),
-        #                                                                               self.get_images(image_fused), max_ratio=8, consist_ratio=0, text_ratio=2, max_mode="l2", consist_mode="l2")
-
-        # loss, ssim_loss, max_loss, color_loss, grad_loss = self.fusion_loss(self.get_images(image_A), self.get_images(image_B),
-        #                                                                               self.get_images(image_fused), max_ratio=8, consist_ratio=4)
-
 
 
         loss, ssim_loss, max_loss, color_loss, grad_loss, semantic_loss, hyperbolic_loss = self.fusion_loss(
@@ -60,53 +42,6 @@ class fusion_prompt_loss(nn.Module):
 
     def get_images(self, images):
         return images
-
-
-# class fusion_prompt_loss(nn.Module):
-#     def __init__(self):
-#         super(fusion_prompt_loss, self).__init__()
-#         self.fusion_loss = fusion_loss()
-#
-#     def forward(self, image_A, image_B, image_fused, task):
-#
-#         image = torch.sum(image_A, dim=1, keepdim=True)
-#         image = image.squeeze().detach().cpu().numpy()
-#
-#         image = (image - image.min()) / (image.max() - image.min())
-#         plt.imshow(image, cmap='gray')
-#         plt.axis('off')
-#         plt.show()
-#
-#         total_loss = 0
-#         total_ssim_loss = 0
-#         total_max_loss = 0
-#         total_color_loss = 0
-#         total_grad_loss = 0
-#         for index in range(len(task)):
-#             c = self.get_images(image_A, index)
-#             if task[index] == "low_light":
-#                 loss, ssim_loss, max_loss, color_loss, grad_loss = self.fusion_loss(self.get_images(image_A, index), self.get_images(image_B, index), self.get_images(image_fused, index),
-#                                                                                       max_ratio=8, consist_ratio=0)
-#             elif task[index] == "over_exposure":
-#                 loss, ssim_loss, max_loss, color_loss, grad_loss = self.fusion_loss(self.get_images(image_A, index), self.get_images(image_B, index),
-#                                                                                       self.get_images(image_fused, index), max_ratio=4, consist_ratio=4,
-#                                                                                       ssim_ratio=0, ir_compose=0, text_ratio=2, max_mode="l2", consist_mode="l2")
-#             elif task[index] == "ir_low_contrast":
-#                 loss, ssim_loss, max_loss, color_loss, grad_loss = self.fusion_loss(self.get_images(image_A, index), self.get_images(image_B, index),
-#                                                                                       self.get_images(image_fused, index), max_ratio=8, consist_ratio=1)
-#             elif task[index] == "ir_noise":
-#                 loss, ssim_loss, max_loss, color_loss, grad_loss = self.fusion_loss(self.get_images(image_A, index), self.get_images(image_B, index),
-#                                                                                       self.get_images(image_fused, index), max_ratio=6, consist_ratio=4)
-#             total_loss += loss
-#             total_ssim_loss += ssim_loss
-#             total_max_loss += max_loss
-#             total_color_loss += color_loss
-#             total_grad_loss += grad_loss
-#         index = index + 1
-#         return total_loss/index, total_ssim_loss/index, total_max_loss/index, total_color_loss/index, total_grad_loss/index
-#
-#     def get_images(self, images, index):
-#         return images[index].unsqueeze(0)
 
 
 class fusion_loss(nn.Module):
@@ -139,10 +74,7 @@ class fusion_loss(nn.Module):
         # loss_semantic = 0.5 * self.loss_func_sementic(htext,hattr)
         loss_semantic = torch.tensor(0).to("cuda:0")
         loss_hyperbolic = 0.005 * distance_all
-        # print(loss_hyperbolic)
 
-        # loss_hyperbolic = torch.tensor(0).to("cuda:0")
-        # total_loss = loss_max + loss_consist + loss_color + loss_text + loss_semantic
         total_loss = loss_ssim + loss_max + loss_consist + loss_color + loss_text + loss_semantic + loss_hyperbolic
         return total_loss, loss_ssim, loss_max, loss_color, loss_text, loss_semantic, loss_hyperbolic
 
@@ -160,37 +92,15 @@ class L_Semantic(nn.Module):
         super(L_Semantic, self).__init__()
 
     def forward(self, htext, hattr):
-        """
-        计算文本特征与属性特征之间的对齐损失。
 
-        参数:
-        - text_features: 文本特征张量，形状为 (batch_size, feature_dim)
-        - attribute_features: 属性特征张量，形状为 (batch_size, feature_dim)
-
-        返回:
-        - alignment_loss: 对齐损失，标量
-        """
         # 计算余弦相似度
         alignment_loss1 = F.mse_loss(htext, hattr)
-        # alignment_loss2 = F.mse_loss(htext, hattr)
-        # alignment_loss3 = F.mse_loss(htext, hattr)
-        # alignment_loss4 = F.mse_loss(htext, hattr)
 
         alignment_loss = alignment_loss1
 
         return alignment_loss
 
     def cosine_similarity(self, x1, x2):
-        """
-        计算两个张量之间的余弦相似度。
-
-        参数:
-        - x1: 第一个张量，形状为 (batch_size, feature_dim)
-        - x2: 第二个张量，形状为 (batch_size, feature_dim)
-
-        返回:
-        - cosine_sim: 余弦相似度，形状为 (batch_size,)
-        """
         # 归一化
         x1_norm = F.normalize(x1, p=2, dim=1)
         x2_norm = F.normalize(x2, p=2, dim=1)
@@ -199,47 +109,6 @@ class L_Semantic(nn.Module):
         cosine_sim = torch.sum(x1_norm * x2_norm, dim=1)
 
         return cosine_sim
-
-
-# class L_hyperbolic(nn.Module):
-#     def __init__(self, curvature=1.0):
-#         super(L_hyperbolic, self).__init__()
-#         self.c = curvature
-#     def forward(self, text_feats, image_feats, temperature=0.1, eps=1e-5):
-#         """
-#         双曲跨模态对齐损失 (简化版)
-#         输入：
-#             text_feats:  torch.Size([2, 9216, 48])  (B, N_txt, D)
-#             image_feats: torch.Size([2, 1, 48])     (B, N_img, D)
-#         输出：
-#             loss: 标量值
-#         """
-#         # 输入维度处理 (确保图像特征与文本特征可广播)
-#         if image_feats.dim() == 3 and image_feats.size(1) == 1:
-#             image_feats = image_feats.expand(-1, text_feats.size(1), -1)  # [2,9216,48]
-#
-#         # 输入约束：投影到庞加莱球内
-#         def _project(x):
-#             norm = x.norm(dim=-1, keepdim=True)
-#             return x / (norm + eps) * (1.0 / torch.sqrt(torch.tensor(self.c)))
-#
-#         u = _project(text_feats)  # 文本特征
-#         v = _project(image_feats)  # 图像特征
-#
-#         # 计算双曲距离 [B, N]
-#         # delta = 1 + 2 * (u - v).pow(2).sum(-1) / ((1 - u.pow(2).sum(-1)) * (1 - v.pow(2).sum(-1)) + eps)
-#         # dist = torch.acosh(delta.clamp(min=1 + eps))
-#
-#         delta = (u - v).sum(1)
-#         dist = 2 * torch.sqrt(torch.tensor(self.c)) * torch.atanh(delta.clamp(min=1 + eps))
-#
-#         # 自适应权重 [B, N]
-#         txt_norms = u.norm(dim=-1)  # [B, N_txt]
-#         img_norms = v.norm(dim=-1)  # [B, N_img]
-#         weights = torch.exp(-(img_norms - txt_norms).abs() / temperature)
-#
-#         # 加权平均
-#         return (weights * dist).mean()
 
 
 class L_color(nn.Module):

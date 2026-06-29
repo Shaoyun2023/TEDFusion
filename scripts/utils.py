@@ -21,52 +21,6 @@ from torchvision.transforms.functional import to_pil_image
 from args_fusion import args
 
 
-low_saturation_prompt_path = "./dataset/EMS_lite2/Low_light/train/text.txt"
-assert os.path.exists(low_saturation_prompt_path), "text prompt root: {} does not exist.".format(
-    low_saturation_prompt_path)
-with open(low_saturation_prompt_path, 'r', encoding='utf-8') as file:
-    low_saturation_lines = file.readlines()
-
-high_saturation_prompt_path = "./dataset/EMS_lite2/Low_light/train/text.txt"
-assert os.path.exists(high_saturation_prompt_path), "text prompt root: {} does not exist.".format(
-    high_saturation_prompt_path)
-with open(high_saturation_prompt_path, 'r', encoding='utf-8') as file:
-    high_saturation_lines = file.readlines()
-
-low_brightness_prompt_path = "./dataset/EMS_lite2/Low_light/train/text.txt"
-assert os.path.exists(low_brightness_prompt_path), "text prompt root: {} does not exist.".format(
-    low_brightness_prompt_path)
-with open(low_brightness_prompt_path, 'r', encoding='utf-8') as file:
-    low_brightness_lines = file.readlines()
-
-high_brightness_prompt_path = "./dataset/EMS_lite2/Low_light/train/text.txt"
-assert os.path.exists(high_brightness_prompt_path), "text prompt root: {} does not exist.".format(
-    high_brightness_prompt_path)
-with open(high_brightness_prompt_path, 'r', encoding='utf-8') as file:
-    high_brightness_lines = file.readlines()
-
-low_texture_complexity_prompt_path = "./dataset/EMS_lite2/Low_light/train/text.txt"
-assert os.path.exists(low_texture_complexity_prompt_path), "text prompt root: {} does not exist.".format(
-    low_texture_complexity_prompt_path)
-with open(low_texture_complexity_prompt_path, 'r', encoding='utf-8') as file:
-    low_texture_complexity_lines = file.readlines()
-
-high_texture_complexity_prompt_path = "./dataset/EMS_lite2/Low_light/train/text.txt"
-assert os.path.exists(high_texture_complexity_prompt_path), "text prompt root: {} does not exist.".format(
-    high_texture_complexity_prompt_path)
-with open(high_texture_complexity_prompt_path, 'r', encoding='utf-8') as file:
-    high_texture_complexity_lines = file.readlines()
-
-low_contrast_prompt_path = "./dataset/EMS_lite2/Low_light/train/text.txt"
-assert os.path.exists(low_contrast_prompt_path), "text prompt root: {} does not exist.".format(low_contrast_prompt_path)
-with open(low_contrast_prompt_path, 'r', encoding='utf-8') as file:
-    low_contrast_lines = file.readlines()
-
-high_contrast_prompt_path = "./dataset/EMS_lite2/Low_light/train/text.txt"
-assert os.path.exists(high_contrast_prompt_path), "text prompt root: {} does not exist.".format(
-    high_contrast_prompt_path)
-with open(high_contrast_prompt_path, 'r', encoding='utf-8') as file:
-    high_contrast_lines = file.readlines()
 
 
 def read_data(root: str):
@@ -158,54 +112,6 @@ def read_data(root: str):
     return train_low_light_path_list, val_low_light_path_list
 
 
-def get_low_saturation_prompt():
-    random_line = random.choice(low_saturation_lines)
-    random_line = random_line.strip()
-    return random_line
-
-
-def get_high_saturation_prompt():
-    random_line = random.choice(high_saturation_lines)
-    random_line = random_line.strip()
-    return random_line
-
-
-def get_low_brightness_prompt():
-    random_line = random.choice(low_brightness_lines)
-    random_line = random_line.strip()
-    return random_line
-
-
-def get_high_brightness_prompt():
-    random_line = random.choice(high_brightness_lines)
-    random_line = random_line.strip()
-    return random_line
-
-
-def get_low_texture_complexity_prompt():
-    random_line = random.choice(low_texture_complexity_lines)
-    random_line = random_line.strip()
-    return random_line
-
-
-def get_high_texture_complexity_prompt():
-    random_line = random.choice(high_texture_complexity_lines)
-    random_line = random_line.strip()
-    return random_line
-
-
-def get_low_contrast_prompt():
-    random_line = random.choice(low_contrast_lines)
-    random_line = random_line.strip()
-    return random_line
-
-
-def get_high_contrast_prompt():
-    random_line = random.choice(high_contrast_lines)
-    random_line = random_line.strip()
-    return random_line
-
-
 def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, device, epoch):
     processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
     model_text = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
@@ -232,86 +138,30 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
 
     data_loader = tqdm(data_loader, file=sys.stdout)
     for step, data in enumerate(data_loader):
-        I_A, I_B, I_A_gt, I_B_gt, _, task, _ = data
+        I_A, I_B, I_A_gt, I_B_gt, I_full, task, name = data
         text_line = []
-
-
 
         # 批量处理
         batch_images1 = [to_pil_image(img) for img in I_A]  # 将每个张量转换为 PIL 图像
-###################################################################################################
+        ###################################################################################################
         # 使用 Blip 生成文本描述
-        # inputs1 = processor(batch_images1, return_tensors="pt")  # 处理批量图像
-        # inputs1 = inputs1.to(device)
-        # out1 = model_text.generate(**inputs1)  # 生成文本描述
-
-        inputs1 = processor(
-            images=batch_images1,
-
-            return_tensors="pt",
-            padding=True
-        ).to(device)
-
-
-
-        out1 = model_text.generate(
-            **inputs1,
-            max_length=60,
-            min_length=20,
-            num_beams=5,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.9,
-            repetition_penalty=1.1
-        )
+        inputs1 = processor(batch_images1, return_tensors="pt")  # 处理批量图像
+        inputs1 = inputs1.to(device)
+        out1 = model_text.generate(**inputs1)  # 生成文本描述
         caption1 = processor.decode(out1[0], skip_special_tokens=True)
         text1 = clip.tokenize(caption1).to(args.device)
-
-
-        print(f"Enhanced Caption1: {caption1}")
-
+        # print(text1)
 
         # 批量处理
         batch_images2 = [to_pil_image(img) for img in I_B]  # 将每个张量转换为 PIL 图像
 
         # 使用 Blip 生成文本描述
-        # inputs2 = processor(batch_images2, return_tensors="pt")  # 处理批量图像
-        # inputs2 = inputs2.to(device)
-        # out2 = model_text.generate(**inputs2)  # 生成文本描述
-
-        inputs2 = processor(
-            images=batch_images2,
-
-            return_tensors="pt",
-            padding=True
-        ).to(device)
-
-        out2 = model_text.generate(
-            **inputs2,
-            max_length=60,
-            min_length=20,
-            num_beams=5,
-            do_sample=True,
-            top_p=0.9,
-            temperature=0.9,
-            repetition_penalty=1.1
-        )
-
+        inputs2 = processor(batch_images2, return_tensors="pt")  # 处理批量图像
+        inputs2 = inputs2.to(device)
+        out2 = model_text.generate(**inputs2)  # 生成文本描述
         caption2 = processor.decode(out2[0], skip_special_tokens=True)
         text2 = clip.tokenize(caption2).to(args.device)
 
-        print(f"Enhanced Caption2: {caption2}")
-        # vocab_size = 49408
-        # text1 = torch.randint(0, vocab_size, (1, 77)).to(args.device)  # 随机整数 token IDs
-        # text2 = torch.randint(0, vocab_size, (1, 77)).to(args.device)
-        # print(text2.shape)
-####################################################################################################
-        # # 解码生成的文本描述
-        # captions = processor.batch_decode(out1, skip_special_tokens=True)  # 批量解码
-        #
-        # # 输出结果
-        # for i, caption in enumerate(captions):
-        #     print(f"Image {i + 1} Description: {caption}")
 
         h1, s1, v1 = mergy_RGB_to_HSV(I_A)
         s_avg1 = calculate_edge(I_A)
@@ -350,8 +200,6 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
         glcm2 = torch.from_numpy(glcm2)
         texture_complexity2 = 0.6 * energy_avg2 + 0.4 * homogeneity_avg2
         contrast2 = calculate_contrast(I_B).detach().cpu().numpy()
-
-
 
 
         if torch.cuda.is_available():
@@ -501,6 +349,7 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
         texture_complexity2 = 0.6 * energy_avg2 + 0.4 * homogeneity_avg2
         contrast2 = calculate_contrast(I_B).detach().cpu().numpy()
 
+
         if torch.cuda.is_available():
             I_A = I_A.to(device)
             I_B = I_B.to(device)
@@ -630,11 +479,6 @@ def mergy_RGB_to_HSV(img):  # [4,3,96,96]
         img_HSV = cv2.cvtColor(single_img, cv2.COLOR_RGB2HSV)
         H, S, V = cv2.split(img_HSV)
 
-    # img = img.squeeze(0).cpu().numpy()
-    # img = np.transpose(img, [1, 2, 0])
-    #
-    # img_HSV = cv2.cvtColor(img, cv2.COLOR_RGB2HSV)
-    # H, S, V = cv2.split(img_HSV)
     return H, S, V
 
 
