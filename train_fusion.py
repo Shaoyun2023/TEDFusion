@@ -18,26 +18,66 @@ import transforms as T
 import random
 import numpy as np
 
-def set_seed_thread(seed):
-    seed = seed
+
+TRAIN_SEED = 104
+
+
+def set_seed(seed):
+    """Configure every random source used by this training program."""
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
+
     random.seed(seed)
-    # th.cuda.set_device(args.gpu)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    torch.use_deterministic_algorithms(True)
+
+
+def seed_worker(worker_id):
+    """Seed Python and NumPy inside each DataLoader worker."""
+    del worker_id
+    worker_seed = torch.initial_seed() % (2 ** 32)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed)
+
+
+def get_rng_state(train_generator, val_generator):
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "train_generator": train_generator.get_state(),
+        "val_generator": val_generator.get_state(),
+    }
+    if torch.cuda.is_available():
+        state["cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def set_rng_state(state, train_generator, val_generator):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch"])
+    train_generator.set_state(state["train_generator"])
+    val_generator.set_state(state["val_generator"])
+    if torch.cuda.is_available() and "cuda" in state:
+        torch.cuda.set_rng_state_all(state["cuda"])
 
 def main(args):
-    # set_seed_thread(333)
-
-
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
+    set_seed(TRAIN_SEED)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    print("Using deterministic training seed: {}".format(TRAIN_SEED))
 
     if os.path.exists("./experiments") is False:
         os.makedirs("./experiments")
 
     file_name = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    filefold_path = "./experiments/TextIF_train_{}".format(file_name)
+    filefold_path = "./experiments/TEDFusion_train_{}".format(file_name)
     os.makedirs(filefold_path)
     file_img_path = os.path.join(filefold_path, "img")
     os.makedirs(file_img_path)
@@ -81,7 +121,7 @@ def main(args):
                             T.RandomVerticalFlip(0.5),
                             T.ToTensor()]),
 
-        "val": T.Compose([T.RandomCrop(96),
+        "val": T.Compose([T.CenterCrop(96),
                           T.Resize_16(),
                           T.ToTensor()])}
 
@@ -110,19 +150,29 @@ def main(args):
     batch_size = args.batch_size
     nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])
     print('Using {} dataloader workers every process'.format(nw))
+
+    train_generator = torch.Generator()
+    train_generator.manual_seed(TRAIN_SEED)
+    val_generator = torch.Generator()
+    val_generator.manual_seed(TRAIN_SEED + 1)
+
     train_loader = torch.utils.data.DataLoader(train_dataset,
                                                batch_size=batch_size,
                                                shuffle=True,
                                                pin_memory=True,
                                                num_workers=nw,
-                                               collate_fn=train_dataset.collate_fn)
+                                               collate_fn=train_dataset.collate_fn,
+                                               worker_init_fn=seed_worker,
+                                               generator=train_generator)
 
     val_loader = torch.utils.data.DataLoader(val_dataset,
                                              batch_size=1,
                                              shuffle=False,
                                              pin_memory=True,
                                              num_workers=nw,
-                                             collate_fn=val_dataset.collate_fn)
+                                             collate_fn=val_dataset.collate_fn,
+                                             worker_init_fn=seed_worker,
+                                             generator=val_generator)
 
     model_clip, _ = clip.load("ViT-B/32", device=device)
     # model = create_model(model_clip, curvature=1.5).to(device)
@@ -146,9 +196,21 @@ def main(args):
 
     if args.resume:
         checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint_seed = checkpoint.get("seed", getattr(checkpoint.get("args"), "seed", None))
+        if checkpoint_seed is not None and checkpoint_seed != TRAIN_SEED:
+            raise ValueError(
+                "The checkpoint seed ({}) does not match TRAIN_SEED ({})."
+                .format(checkpoint_seed, TRAIN_SEED)
+            )
         model.load_state_dict(checkpoint['model'])
+        optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         start_epoch = checkpoint['epoch'] + 1
+        best_val_loss = checkpoint.get("best_val_loss", best_val_loss)
+        if "rng_state" in checkpoint:
+            set_rng_state(checkpoint["rng_state"], train_generator, val_generator)
+        else:
+            print("WARNING: checkpoint has no RNG state; resumed training cannot be exactly reproduced.")
 
     for epoch in range(start_epoch, args.epochs):
         # train
@@ -182,34 +244,25 @@ def main(args):
             tb_writer.add_scalar("val_semantic_loss", val_semantic_loss, epoch)
             tb_writer.add_scalar("val_hyperbolic_loss", val_semantic_loss, epoch)
 
-            if val_loss < best_val_loss:
-                if args.use_dp == True:
-                    save_file = {"model": model.module.state_dict(),
-                                 "optimizer": optimizer.state_dict(),
-                                 "lr_scheduler": lr_scheduler.state_dict(),
-                                 "epoch": epoch,
-                                 "args": args}
-                else:
-                    save_file = {"model": model.state_dict(),
-                                 "optimizer": optimizer.state_dict(),
-                                 "lr_scheduler": lr_scheduler.state_dict(),
-                                 "epoch": epoch,
-                                 "args": args}
-                torch.save(save_file, file_weights_path + "/" + "checkpoint.pth")
+            is_best = val_loss < best_val_loss
+            if is_best:
                 best_val_loss = val_loss
-            
-            if args.use_dp == True:
-                    save_file = {"model": model.module.state_dict(),
-                                 "optimizer": optimizer.state_dict(),
-                                 "lr_scheduler": lr_scheduler.state_dict(),
-                                 "epoch": epoch,
-                                 "args": args}
-            else:
-                    save_file = {"model": model.state_dict(),
-                                 "optimizer": optimizer.state_dict(),
-                                 "lr_scheduler": lr_scheduler.state_dict(),
-                                 "epoch": epoch,
-                                 "args": args}
+
+            model_state = model.module.state_dict() if args.use_dp == True else model.state_dict()
+            save_file = {
+                "model": model_state,
+                "optimizer": optimizer.state_dict(),
+                "lr_scheduler": lr_scheduler.state_dict(),
+                "epoch": epoch,
+                "args": args,
+                "seed": TRAIN_SEED,
+                "best_val_loss": best_val_loss,
+                "rng_state": get_rng_state(train_generator, val_generator),
+            }
+
+            if is_best:
+                torch.save(save_file, file_weights_path + "/" + "checkpoint.pth")
+
             torch.save(save_file, file_weights_path + "/" + "checkpoint_lastest.pth")
 
 
@@ -223,10 +276,10 @@ if __name__ == '__main__':
     parser.add_argument('--batch-size', type=int, default=2)
     parser.add_argument('--lr', type=float, default=0.0001)
 
-    parser.add_argument('--low_light_path', type=str, default="./dataset/train_MSRS")
-    parser.add_argument('--over_exposure_path', type=str, default="./dataset/train_MSRS")
-    parser.add_argument('--ir_low_contrast_path', type=str, default="./dataset/train_MSRS")
-    parser.add_argument('--ir_noise_path', type=str, default="./dataset/train_MSRS")
+    parser.add_argument('--low_light_path', type=str, default="./dataset/train_MSRS2")
+    parser.add_argument('--over_exposure_path', type=str, default="./dataset/train_MSRS2")
+    parser.add_argument('--ir_low_contrast_path', type=str, default="./dataset/train_MSRS2")
+    parser.add_argument('--ir_noise_path', type=str, default="./dataset/train_MSRS2")
 
     parser.add_argument('--weights', type=str, default='',
                         help='initial weights path')
