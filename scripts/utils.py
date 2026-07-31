@@ -21,6 +21,40 @@ from torchvision.transforms.functional import to_pil_image
 from args_fusion import args
 
 
+BLIP_MODEL_ID = "Salesforce/blip-image-captioning-base"
+BLIP_MODEL_PATH = os.environ.get("BLIP_MODEL_PATH", BLIP_MODEL_ID)
+
+
+def load_local_blip():
+    """Load BLIP exclusively from a local directory or the local HF cache."""
+    model_source = os.path.expandvars(os.path.expanduser(BLIP_MODEL_PATH))
+    if model_source != BLIP_MODEL_ID:
+        model_source = os.path.abspath(model_source)
+        if not os.path.isdir(model_source):
+            raise FileNotFoundError(
+                "BLIP_MODEL_PATH 指向的本地模型目录不存在: '{}'"
+                .format(model_source)
+            )
+
+    try:
+        processor = BlipProcessor.from_pretrained(
+            model_source,
+            local_files_only=True,
+        )
+        model_text = BlipForConditionalGeneration.from_pretrained(
+            model_source,
+            local_files_only=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(
+            "无法从本地加载 BLIP 模型。请将完整的 "
+            "'Salesforce/blip-image-captioning-base' 模型保存到本地目录，"
+            "然后设置环境变量 BLIP_MODEL_PATH 指向该目录。"
+        ) from exc
+
+    return processor, model_text
+
+
 
 
 def read_data(root: str):
@@ -113,8 +147,7 @@ def read_data(root: str):
 
 
 def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, device, epoch):
-    processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-    model_text = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+    processor, model_text = load_local_blip()
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model_text = model_text.to(device)
@@ -256,8 +289,7 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
 
 @torch.no_grad()
 def evaluate(model, data_loader, device, epoch, lr, filefold_path):
-    processor = BlipProcessor.from_pretrained("Salesforce/blip-image-captioning-base")
-    model_text = BlipForConditionalGeneration.from_pretrained("Salesforce/blip-image-captioning-base")
+    processor, model_text = load_local_blip()
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
     model_text = model_text.to(device)
 
@@ -535,4 +567,3 @@ def calculate_edge(tensor):
     edge_strength = np.mean(gradient_magnitude)
 
     return edge_strength
-
