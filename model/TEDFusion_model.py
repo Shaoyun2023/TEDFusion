@@ -12,8 +12,7 @@ from prompt_toolkit.filters import has_arg
 from sympy.physics.units import percent
 from tensorboard.compat.tensorflow_stub.dtypes import float64
 
-from GmSa.grassmann import FRMap, QRComposition,QR, Projmap, Orthmap,Orthmap2, OrthmapFunction, ProjPoolLayer, ProjPoolLayer_A
-from GmSa.GSMA import E2R,E2R2 ,AttentionManifold
+
 from args_fusion import args
 from scipy.spatial.distance import jensenshannon
 
