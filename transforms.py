@@ -108,12 +108,13 @@ class CenterCrop(object):
     def __init__(self, size):
         self.size = size
 
-    def __call__(self, image, target, image_gt, target_gt):
+    def __call__(self, image, target, image_gt, target_gt, image_full):
         image = F.center_crop(image, self.size)
         target = F.center_crop(target, self.size)
         image_gt = F.center_crop(image_gt, self.size)
         target_gt = F.center_crop(target_gt, self.size)
-        return image, target, image_gt, target_gt
+        image_full = F.center_crop(image_full, self.size)
+        return image, target, image_gt, target_gt, image_full
 
 
 class ToTensor(object):

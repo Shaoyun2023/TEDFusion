@@ -19,7 +19,8 @@ import random
 import numpy as np
 
 
-TRAIN_SEED = 104
+TRAIN_SEED = 122345
+UPSAMPLE_MODULE_NAMES = ("up4_3", "up3_2", "up2_1", "up2_1_2")
 
 
 def set_seed(seed):
@@ -67,11 +68,42 @@ def set_rng_state(state, train_generator, val_generator):
     if torch.cuda.is_available() and "cuda" in state:
         torch.cuda.set_rng_state_all(state["cuda"])
 
+
+def freeze_pretrained_upsamplers(model):
+    """Keep the pretrained PixelShuffle filters phase-balanced during fine-tuning."""
+    base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    frozen_parameters = 0
+    for module_name in UPSAMPLE_MODULE_NAMES:
+        module = getattr(base_model, module_name)
+        for parameter in module.parameters():
+            parameter.requires_grad = False
+            frozen_parameters += parameter.numel()
+    return frozen_parameters
+
+
+@torch.no_grad()
+def initialize_pixelshuffle_phases(model):
+    """Give all four sub-pixel phases the same from-scratch initialization."""
+    initialized_parameters = 0
+    for module_name in UPSAMPLE_MODULE_NAMES:
+        weight = getattr(model, module_name).body[0].weight
+        phase_weight = weight.view(weight.shape[0] // 4, 4, *weight.shape[1:])
+        reference_phase = phase_weight[:, :1].clone()
+        phase_weight.copy_(reference_phase.expand_as(phase_weight))
+        initialized_parameters += weight.numel()
+    return initialized_parameters
+
 def main(args):
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_id
     set_seed(TRAIN_SEED)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print("Using deterministic training seed: {}".format(TRAIN_SEED))
+
+    if args.dataset_path is not None:
+        args.low_light_path = args.dataset_path
+        args.over_exposure_path = args.dataset_path
+        args.ir_low_contrast_path = args.dataset_path
+        args.ir_noise_path = args.dataset_path
 
     if os.path.exists("./experiments") is False:
         os.makedirs("./experiments")
@@ -134,7 +166,9 @@ def main(args):
                                   train_ir_noise_path_list=train_ir_noise_path_list,
                                   val_ir_noise_path_list=val_ir_noise_path_list,
                                   phase="train",
-                              transform=data_transform["train"])
+                                  transform=data_transform["train"],
+                                  samples_per_epoch=args.samples_per_epoch,
+                                  max_val_samples=args.max_val_samples)
 
     val_dataset = PromptDataSet(train_low_light_path_list=train_low_light_path_list,
                                   val_low_light_path_list=val_low_light_path_list,
@@ -145,7 +179,14 @@ def main(args):
                                   train_ir_noise_path_list=train_ir_noise_path_list,
                                   val_ir_noise_path_list=val_ir_noise_path_list,
                                   phase="val",
-                            transform=data_transform["val"])
+                                  transform=data_transform["val"],
+                                  samples_per_epoch=args.samples_per_epoch,
+                                  max_val_samples=args.max_val_samples)
+
+    print("Training draws {} samples per epoch from {} unique image pairs ({} unique dataset slot(s)).".format(
+        len(train_dataset), train_dataset.num_unique_pairs, len(train_dataset.task_keys)
+    ))
+    print("Validation uses {} deterministic image pairs.".format(len(val_dataset)))
 
     batch_size = args.batch_size
     nw = min([os.cpu_count(), batch_size if batch_size > 1 else 0, 8])
@@ -181,28 +222,55 @@ def main(args):
     for param in model.model_clip.parameters():
         param.requires_grad = False
 
-    if args.use_dp == True:
-        model = torch.nn.DataParallel(model).cuda()
+    checkpoint = None
+    checkpoint_args = None
+    if args.resume:
+        checkpoint = torch.load(args.resume, map_location='cpu')
+        checkpoint_args = checkpoint.get("args")
 
-    if args.weights != "":
+    if checkpoint is not None:
+        model.load_state_dict(checkpoint['model'])
+    elif args.weights != "":
         assert os.path.exists(args.weights), "weights file: '{}' not exist.".format(args.weights)
         weights_dict = torch.load(args.weights, map_location=device)["model"]
         print(model.load_state_dict(weights_dict, strict=False))
+    else:
+        initialized_parameters = initialize_pixelshuffle_phases(model)
+        print("Checkerboard guard: phase-aligned {:,} PixelShuffle parameters.".format(
+            initialized_parameters
+        ))
 
+    resumed_from_pretrained = bool(getattr(checkpoint_args, "weights", ""))
+    is_finetuning = args.weights != "" or resumed_from_pretrained
+    checkpoint_trained_upsamplers = bool(getattr(checkpoint_args, "train_upsamplers", False))
+    protect_upsamplers = is_finetuning and not (args.train_upsamplers or checkpoint_trained_upsamplers)
+    if protect_upsamplers:
+        frozen_parameters = freeze_pretrained_upsamplers(model)
+        print("Fine-tuning guard: froze {:,} pretrained PixelShuffle-convolution parameters.".format(
+            frozen_parameters
+        ))
+
+    if args.use_dp == True:
+        model = torch.nn.DataParallel(model).cuda()
 
     pg = [p for p in model.parameters() if p.requires_grad]
-    optimizer = optim.AdamW(pg, lr=args.lr, weight_decay=5E-2)
+    learning_rate = args.lr
+    if learning_rate is None:
+        learning_rate = 2e-5 if is_finetuning else 1e-4
+    weight_decay = args.weight_decay
+    if weight_decay is None:
+        weight_decay = 1e-4 if is_finetuning else 5e-2
+    print("Optimizer: AdamW(lr={}, weight_decay={})".format(learning_rate, weight_decay))
+    optimizer = optim.AdamW(pg, lr=learning_rate, weight_decay=weight_decay)
     lr_scheduler = create_lr_scheduler(optimizer, len(train_loader), args.epochs, warmup=True)
 
-    if args.resume:
-        checkpoint = torch.load(args.resume, map_location='cpu')
+    if checkpoint is not None:
         checkpoint_seed = checkpoint.get("seed", getattr(checkpoint.get("args"), "seed", None))
         if checkpoint_seed is not None and checkpoint_seed != TRAIN_SEED:
             raise ValueError(
                 "The checkpoint seed ({}) does not match TRAIN_SEED ({})."
                 .format(checkpoint_seed, TRAIN_SEED)
             )
-        model.load_state_dict(checkpoint['model'])
         optimizer.load_state_dict(checkpoint['optimizer'])
         lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
         start_epoch = checkpoint['epoch'] + 1
@@ -220,7 +288,8 @@ def main(args):
                                                 data_loader=train_loader,
                                                 lr_scheduler=lr_scheduler,
                                                 device=device,
-                                                epoch=epoch)
+                                                epoch=epoch,
+                                                grad_clip_norm=args.grad_clip_norm)
 
         tb_writer.add_scalar("train_total_loss", train_loss, epoch)
         tb_writer.add_scalar("train_ssim_loss", train_ssim_loss, epoch)
@@ -274,15 +343,28 @@ if __name__ == '__main__':
     # set the appropriate batch-size value for your device
     # parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--batch-size', type=int, default=2)
-    parser.add_argument('--lr', type=float, default=0.0001)
+    parser.add_argument('--lr', type=float, default=None,
+                        help='learning rate (default: 2e-5 for fine-tuning, 1e-4 from scratch)')
+    parser.add_argument('--weight_decay', type=float, default=None,
+                        help='AdamW weight decay (default: 1e-4 for fine-tuning, 5e-2 from scratch)')
+    parser.add_argument('--grad_clip_norm', type=float, default=1.0,
+                        help='clip gradient norm to stabilize fine-tuning; <=0 disables it')
+    parser.add_argument('--samples_per_epoch', type=int, default=800,
+                        help='random training pairs drawn per epoch; 800 matches the original small-MSRS run')
+    parser.add_argument('--max_val_samples', type=int, default=80,
+                        help='maximum number of deterministic validation pairs')
 
-    parser.add_argument('--low_light_path', type=str, default="./dataset/train_MSRS2")
-    parser.add_argument('--over_exposure_path', type=str, default="./dataset/train_MSRS2")
-    parser.add_argument('--ir_low_contrast_path', type=str, default="./dataset/train_MSRS2")
-    parser.add_argument('--ir_noise_path', type=str, default="./dataset/train_MSRS2")
+    parser.add_argument('--dataset_path', type=str, default=None,
+                        help='set one dataset root for all four task slots')
+    parser.add_argument('--low_light_path', type=str, default="./dataset/train_MSRS")
+    parser.add_argument('--over_exposure_path', type=str, default="./dataset/train_MSRS")
+    parser.add_argument('--ir_low_contrast_path', type=str, default="./dataset/train_MSRS")
+    parser.add_argument('--ir_noise_path', type=str, default="./dataset/train_MSRS")
 
     parser.add_argument('--weights', type=str, default='',
                         help='initial weights path')
+    parser.add_argument('--train_upsamplers', action='store_true',
+                        help='also update PixelShuffle convolutions when fine-tuning (not recommended for MSRS)')
     parser.add_argument('--val_every_epcho', type=int, default=2, help='val every epcho')
     parser.add_argument('--resume', default='', help='resume from checkpoint')
     parser.add_argument('--use_dp', default = False, help='use dp-multigpus')

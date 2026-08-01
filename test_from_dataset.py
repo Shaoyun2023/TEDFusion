@@ -28,7 +28,7 @@ def set_seed_thread(seed):
     torch.cuda.manual_seed(seed)
 
 def main(args):
-    # set_seed_thread(200)
+    set_seed_thread(2010)
 
     root_path = args.dataset_path
     save_path = args.save_path
@@ -74,16 +74,19 @@ def main(args):
         ir = Image.open(ir_path).convert(mode="RGB")
         vi = Image.open(vi_path).convert(mode="RGB")
 
-        height, width = vi.size
+        width, height = vi.size
+        assert ir.size == vi.size, "The visible and infrared image sizes do not match: {} vs {}".format(
+            vi.size, ir.size
+        )
 
-        new_width = (width // 16) * 16
-
-        new_height = (height // 16) * 16
-
-
-
-        ir = ir.resize((new_height, new_width))
-        vi = vi.resize((new_height, new_width))
+        # Three PixelUnshuffle stages require a multiple of 8. Reflection padding
+        # preserves the original pixels and avoids nearest-neighbour resize artifacts.
+        pad_right = (-width) % 8
+        pad_bottom = (-height) % 8
+        if pad_right or pad_bottom:
+            padding = [0, 0, pad_right, pad_bottom]
+            ir = F.pad(ir, padding, padding_mode="reflect")
+            vi = F.pad(vi, padding, padding_mode="reflect")
 
         ir = F.to_tensor(ir)
         vi = F.to_tensor(vi)
@@ -134,7 +137,9 @@ def main(args):
 
         with torch.no_grad():
 
-            shifts = [(0, 0), (0, 1), (1, 0), (1, 1)]  # 4个方向的1像素偏移
+            # The dominant artifact has a 2-pixel phase, so retain all four
+            # parity combinations without increasing inference time.
+            shifts = [(0, 0), (0, 1), (1, 0), (1, 1)]
             outputs = []
 
             for dy, dx in shifts:
@@ -145,6 +150,7 @@ def main(args):
                 outputs.append(out_unshifted)
 
             i = torch.stack(outputs).mean(dim=0)
+            i = i[:, :, :height, :width]
             # i = model(vi, ir,feature)
             text1 = torch.tensor(0)
             text2 = torch.tensor(0)
@@ -174,10 +180,10 @@ def mergy_Y_RGB_to_YCbCr(img1, img2):
     return merged_img
 
 def save_pic(outputpic, path, index : str):
-    outputpic[outputpic > 1.] = 1
-    outputpic[outputpic < 0.] = 0
-    outputpic = cv2.UMat(outputpic).get()
-    outputpic = cv2.normalize(outputpic, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_32F)
+    # Do not stretch every output independently: it amplifies faint periodic
+    # decoder errors in low-light images.
+    outputpic = np.clip(outputpic, 0.0, 1.0)
+    outputpic = np.rint(outputpic * 255.0).astype(np.uint8)
     outputpic=outputpic[:, :, ::-1]
     save_path = os.path.join(path, index).replace(".jpg", ".png")
     cv2.imwrite(save_path, outputpic)
