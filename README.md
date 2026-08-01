@@ -8,6 +8,17 @@ Accetped by [ICML 2026] 🔗"https://arxiv.org/pdf/2606.15104"
 ----
 The model can be found in https://pan.baidu.com/s/1Daz11onyLza_jLuXcBy1mA?pwd=h5b6 and the password is: h5b6
 
+🖥️Environment
+----
+python==3.12.7
+
+pytorch==2.5.1
+
+pytorch-cuda==12.6
+
+scipy==1.13.1
+
+numpy==1.26.4
 
 
 ⚙️Training
