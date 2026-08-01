@@ -65,20 +65,10 @@ def read_data(root: str):
     assert os.path.exists(train_root), "train root: {} does not exist.".format(train_root)
     assert os.path.exists(val_root), "val root: {} does not exist.".format(val_root)
 
-    train_images_visible_path = []
-    train_images_infrared_path = []
-    train_images_visible_gt_path = []
-    train_images_infrared_gt_path = []
-    val_images_visible_path = []
-    val_images_infrared_path = []
-
     supported = [".jpg", ".JPG", ".png", ".PNG", ".bmp", 'tif', 'TIF']  # 支持的文件后缀类型
 
     train_visible_root = os.path.join(train_root, "Visible")
     train_infrared_root = os.path.join(train_root, "Infrared")
-
-    train_visible_gt_root = os.path.join(train_root, "Visible_gt")
-    train_infrared_gt_root = os.path.join(train_root, "Infrared_gt")
 
     val_visible_root = os.path.join(val_root, "Visible")
     val_infrared_root = os.path.join(val_root, "Infrared")
@@ -88,11 +78,6 @@ def read_data(root: str):
     train_infrared_path = [os.path.join(train_infrared_root, i) for i in os.listdir(train_infrared_root)
                            if os.path.splitext(i)[-1] in supported]
 
-    train_visible_gt_path = [os.path.join(train_visible_gt_root, i) for i in os.listdir(train_visible_gt_root)
-                             if os.path.splitext(i)[-1] in supported]
-    train_infrared_gt_path = [os.path.join(train_infrared_gt_root, i) for i in os.listdir(train_infrared_gt_root)
-                              if os.path.splitext(i)[-1] in supported]
-
     val_visible_path = [os.path.join(val_visible_root, i) for i in os.listdir(val_visible_root)
                         if os.path.splitext(i)[-1] in supported]
     val_infrared_path = [os.path.join(val_infrared_root, i) for i in os.listdir(val_infrared_root)
@@ -100,8 +85,6 @@ def read_data(root: str):
 
     train_visible_path.sort()
     train_infrared_path.sort()
-    train_visible_gt_path.sort()
-    train_infrared_gt_path.sort()
     val_visible_path.sort()
     val_infrared_path.sort()
 
@@ -113,40 +96,36 @@ def read_data(root: str):
         format(len(val_visible_path), len(val_infrared_path))
     print("Visible and Infrared images check finish")
 
-    for index in range(len(train_visible_path)):
-        img_visible_path = train_visible_path[index]
-        img_infrared_path = train_infrared_path[index]
-        train_images_visible_path.append(img_visible_path)
-        train_images_infrared_path.append(img_infrared_path)
-
-        img_visible_gt_path = train_visible_gt_path[index]
-        img_infrared_gt_path = train_infrared_gt_path[index]
-        train_images_visible_gt_path.append(img_visible_gt_path)
-        train_images_infrared_gt_path.append(img_infrared_gt_path)
-
-    for index in range(len(val_visible_path)):
-        img_visible_path = val_visible_path[index]
-        img_infrared_path = val_infrared_path[index]
-        val_images_visible_path.append(img_visible_path)
-        val_images_infrared_path.append(img_infrared_path)
-
-    total_dataset_nums = len(train_visible_path) + len(train_infrared_path) + len(train_visible_gt_path) + len(
-        train_infrared_gt_path) \
-                         + len(val_visible_path) + len(val_infrared_path)
+    total_dataset_nums = (len(train_visible_path) + len(train_infrared_path)
+                          + len(val_visible_path) + len(val_infrared_path))
     print("{} images were found in the dataset.".format(total_dataset_nums))
     print("{} visible images for training.".format(len(train_visible_path)))
     print("{} infrared images for training.".format(len(train_infrared_path)))
-    print("{} visible gt images for training.".format(len(train_visible_gt_path)))
-    print("{} infrared gt images for training.".format(len(train_infrared_gt_path)))
     print("{} visible images for validation.".format(len(val_visible_path)))
     print("{} infrared images for validation.\n".format(len(val_infrared_path)))
 
-    train_low_light_path_list = [train_visible_path, train_infrared_path, train_visible_gt_path, train_infrared_gt_path]
+    train_low_light_path_list = [train_visible_path, train_infrared_path]
     val_low_light_path_list = [val_visible_path, val_infrared_path]
     return train_low_light_path_list, val_low_light_path_list
 
 
-def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, device, epoch):
+@torch.no_grad()
+def balance_pixelshuffle_dc(model):
+    """Equalize per-input-channel DC gain across the four PixelShuffle phases."""
+    base_model = model.module if isinstance(model, torch.nn.DataParallel) else model
+    for module_name in ("up4_3", "up3_2", "up2_1", "up2_1_2"):
+        weight = getattr(base_model, module_name).body[0].weight
+        if not weight.requires_grad:
+            continue
+        phase_weight = weight.view(weight.shape[0] // 4, 4, *weight.shape[1:])
+        phase_dc = phase_weight.sum(dim=(-2, -1), keepdim=True)
+        target_dc = phase_dc.mean(dim=1, keepdim=True)
+        kernel_area = weight.shape[-2] * weight.shape[-1]
+        phase_weight.add_((target_dc - phase_dc) / kernel_area)
+
+
+def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, device, epoch,
+                    grad_clip_norm=1.0):
     processor, model_text = load_local_blip()
 
     device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -181,8 +160,8 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
         inputs1 = processor(batch_images1, return_tensors="pt")  # 处理批量图像
         inputs1 = inputs1.to(device)
         out1 = model_text.generate(**inputs1)  # 生成文本描述
-        caption1 = processor.decode(out1[0], skip_special_tokens=True)
-        text1 = clip.tokenize(caption1).to(args.device)
+        captions1 = processor.batch_decode(out1, skip_special_tokens=True)
+        text1 = clip.tokenize(captions1).to(args.device)
         # print(text1)
 
         # 批量处理
@@ -192,8 +171,8 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
         inputs2 = processor(batch_images2, return_tensors="pt")  # 处理批量图像
         inputs2 = inputs2.to(device)
         out2 = model_text.generate(**inputs2)  # 生成文本描述
-        caption2 = processor.decode(out2[0], skip_special_tokens=True)
-        text2 = clip.tokenize(caption2).to(args.device)
+        captions2 = processor.batch_decode(out2, skip_special_tokens=True)
+        text2 = clip.tokenize(captions2).to(args.device)
 
 
         h1, s1, v1 = mergy_RGB_to_HSV(I_A)
@@ -260,6 +239,12 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
 
         loss.backward()
 
+        if grad_clip_norm is not None and grad_clip_norm > 0:
+            torch.nn.utils.clip_grad_norm_(
+                (parameter for parameter in model.parameters() if parameter.requires_grad),
+                grad_clip_norm,
+            )
+
         accu_total_loss += loss.detach()
         accu_ssim_loss += loss_ssim.detach()
         accu_max_loss += loss_max.detach()
@@ -280,6 +265,7 @@ def train_one_epoch(model, model_clip, optimizer, lr_scheduler, data_loader, dev
             sys.exit(1)
 
         optimizer.step()
+        balance_pixelshuffle_dc(model)
         lr_scheduler.step()
         optimizer.zero_grad()
 
@@ -329,8 +315,8 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
         inputs1 = processor(batch_images1, return_tensors="pt")  # 处理批量图像
         inputs1 = inputs1.to(device)
         out1 = model_text.generate(**inputs1)  # 生成文本描述
-        caption1 = processor.decode(out1[0], skip_special_tokens=True)
-        text1 = clip.tokenize(caption1).to(args.device)
+        captions1 = processor.batch_decode(out1, skip_special_tokens=True)
+        text1 = clip.tokenize(captions1).to(args.device)
         # print(text1)
 
         # 批量处理
@@ -340,8 +326,8 @@ def evaluate(model, data_loader, device, epoch, lr, filefold_path):
         inputs2 = processor(batch_images2, return_tensors="pt")  # 处理批量图像
         inputs2 = inputs2.to(device)
         out2 = model_text.generate(**inputs2)  # 生成文本描述
-        caption2 = processor.decode(out2[0], skip_special_tokens=True)
-        text2 = clip.tokenize(caption2).to(args.device)
+        captions2 = processor.batch_decode(out2, skip_special_tokens=True)
+        text2 = clip.tokenize(captions2).to(args.device)
 
         ####################################################################################################
 
@@ -464,10 +450,10 @@ def create_lr_scheduler(optimizer,
 
 
 def save_pic(outputpic, path, index: str):
-    outputpic[outputpic > 1.] = 1
-    outputpic[outputpic < 0.] = 0
-    outputpic = cv2.UMat(outputpic).get()
-    outputpic = cv2.normalize(outputpic, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_32F)
+    # Preserve the network's absolute intensity. Per-image min-max normalization
+    # makes tiny periodic errors conspicuous, especially in dark MSRS scenes.
+    outputpic = np.clip(outputpic, 0.0, 1.0)
+    outputpic = np.rint(outputpic * 255.0).astype(np.uint8)
     outputpic = outputpic[:, :, ::-1]
     save_path = os.path.join(path, index + ".png")
     cv2.imwrite(save_path, outputpic)
