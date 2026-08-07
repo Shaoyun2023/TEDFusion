@@ -1,186 +1,22 @@
-"""TEDFusion model with checkpoint-compatible attribute-guided inference.
-
-The model architecture and parameter schema are retained.  ``Text_IF1`` fixes
-the released inference path so that its eight image attributes form the
-256-dimensional ATGFM guidance and that guidance is injected by TIAM at all
-four decoder scales.  ``FeatureWiseAffine`` also reuses its registered
-projection instead of constructing a random layer during every forward pass.
-No parameter names or shapes are changed, therefore the released
-``TEDFusion.pth`` checkpoint remains strictly loadable.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numbers
 import math
 from einops import rearrange
-import matplotlib.pyplot as plt
 import numpy as np
-from labelme.utils import distance
-from sklearn.manifold import TSNE
-from prompt_toolkit.filters import has_arg
-from sympy.physics.units import percent
-from tensorboard.compat.tensorflow_stub.dtypes import float64
-
-
 from args_fusion import args
-from scipy.spatial.distance import jensenshannon
-
-
-from sklearn.decomposition import PCA
-
 
 def hyperbolic_projection(x):
-    """极简双曲投影：x -> x / (||x|| + 1) 模拟庞加莱球"""
     return x / (x.norm(dim=-1, keepdim=True) + 1)
 
 
-def visualize_crossmodal_similarity(img1,img2, text1,text2, title):
-    image = torch.sum(img2, dim=0, keepdim=True)
-    image = torch.sum(image, dim=1, keepdim=True)
-
-    image = image.squeeze().detach().cpu().numpy()
-
-    image = (image - image.min()) / (image.max() - image.min())
-    plt.imshow(image, cmap='jet')
-    plt.axis('off')
-    plt.show()
-    """
-    可视化图像局部区域与文本特征的相似度热力图
-    img_feat: [2, 384, 12, 12] 图像特征
-    text_feat: [2, 384, 1, 1] 文本特征
-    title: 图像标题
-    """
-    hh = img1.shape[2]
-    # 将文本特征展平为[2, 384]
-    text1 = text1.squeeze(-1).squeeze(-1)  # [2, 384]
-    text2 = text2.squeeze(-1).squeeze(-1)  # [2, 384]
-
-    # 计算欧式空间相似度（余弦相似度）
-    img1 = img1.flatten(2).permute(0, 2, 1)  # [2, 144, 384]
-    img2 = img2.flatten(2).permute(0, 2, 1)  # [2, 144, 384]
-    # print(img1.shape,"img1")
-    # print(text1.shape,"text1")
-    euclidean_sim = F.cosine_similarity(img1, text1.unsqueeze(1), dim=-1)  # [2, 144]
-
-    # 计算双曲空间相似度（负距离）
-
-    c1 = torch.tensor(0.1, device=img2.device, dtype=img2.dtype)
-    c1 = torch.clamp_min(c1, 1e-8)
-
-    c2 = torch.tensor(0.1, device=text2.device, dtype=text2.dtype)
-    c2 = torch.clamp_min(c2, 1e-8)
-
-    # img2 = safe_project(img2,c1)
-    # text2 = safe_project(text2,c2)
-
-    # print(img2,"img")
-    # print(text2,"text")
-    hyperbolic_sim = F.cosine_similarity(img2, text2.unsqueeze(1),dim=-1)  # [2, 144]
-
-    # 调整形状为[2, 12, 12]
-    euclidean_sim = euclidean_sim.view(2, hh,hh)
-    hyperbolic_sim = hyperbolic_sim.view(2, hh,hh)
-
-    # 可视化
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-
-    for i in range(2):
-        # 欧式空间相似度热力图
-        axes[0, i].imshow(euclidean_sim[i].detach().cpu().numpy(), cmap='viridis')
-        axes[0, i].set_title(f"样本{i} - 欧式空间相似度")
-        axes[0, i].axis('off')
-
-        # 双曲空间相似度热力图
-        axes[1, i].imshow(hyperbolic_sim[i].detach().cpu().numpy(), cmap='viridis')
-        axes[1, i].set_title(f"样本{i} - 双曲空间相似度")
-        axes[1, i].axis('off')
-
-    plt.suptitle(title, fontsize=14)
-    plt.tight_layout()
-    plt.show()
-
-    # 打印统计信息
-    print(f"欧式空间相似度范围: [{euclidean_sim.min():.3f}, {euclidean_sim.max():.3f}]")
-    print(f"双曲空间相似度范围: [{hyperbolic_sim.min():.3f}, {hyperbolic_sim.max():.3f}]")
-    print(f"双曲空间相似度方差: {hyperbolic_sim.var():.3f} (通常更高，表示更清晰的关联)")
-
-
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-import numpy as np
-
-
-def perform_sensitivity_analysis(h_attr, h_text):
-    """
-    灵敏度分析：计算不同 dropout 概率下，融合特征与原始文本特征的偏离程度
-    """
-    probs = np.linspace(0, 1, 11)  # 0.0, 0.1, ..., 1.0
-    distances = []
-    cos_sims = []
-
-    # 转换到同一维度进行对比 (假设对比第一个分支 h_text11)
-    # 为了简化，我们观察 mask 逻辑对特征分布的影响
-    with torch.no_grad():
-        for p in probs:
-            # 模拟多次随机实验取平均值
-            temp_dist = []
-            temp_sim = []
-            for _ in range(100):
-                mask = (torch.rand(h_text.size(0), 1).to(h_text.device) < p).float()
-                # 模拟 forward 中的融合逻辑
-                h_fused = mask * h_attr + (1 - mask) * h_text
-
-                # 计算欧式距离 (数值稳定性)
-                dist = torch.norm(h_fused - h_text, p=2, dim=1).mean().item()
-                # 计算余弦相似度 (语义一致性)
-                sim = F.cosine_similarity(h_fused, h_text).mean().item()
-
-                temp_dist.append(dist)
-                temp_sim.append(sim)
-
-            distances.append(np.mean(temp_dist))
-            cos_sims.append(np.mean(temp_sim))
-
-    # --- 可视化部分 ---
-    fig, ax1 = plt.subplots(figsize=(8, 5))
-
-    color = 'tab:red'
-    ax1.set_xlabel('Dropout Probability (p)')
-    ax1.set_ylabel('L2 Distance (Deviation)', color=color)
-    ax1.plot(probs, distances, marker='o', color=color, label='L2 Distance')
-    ax1.tick_params(axis='y', labelcolor=color)
-    ax1.grid(True, alpha=0.3)
-
-    ax2 = ax1.twinx()
-    color = 'tab:blue'
-    ax2.set_ylabel('Cosine Similarity (Consistency)', color=color)
-    ax2.plot(probs, cos_sims, marker='s', color=color, label='Cosine Similarity')
-    ax2.tick_params(axis='y', labelcolor=color)
-
-    # 标注我们的设置 0.3
-    plt.axvline(x=0.3, color='green', linestyle='--', label='Selected p=0.3')
-
-    plt.title('Sensitivity Analysis of Text Dropout Rate')
-    fig.tight_layout()
-    plt.show()
-
-    # 返回数值用于日志记录
-    return dict(zip(probs.round(2), cos_sims))
 
 
 def poincare_distance(u, v):
     c = torch.tensor(1.0).to(args.device)
     eps = torch.tensor(1e-5).to(args.device)
-    """
-    计算庞加莱球中的双曲距离（公式8）
-    Args:
-        u: [..., D] 输入向量1
-        v: [..., D] 输入向量2
-    Returns:
-        [...,] 双曲距离
-    """
+    """计算庞加莱球中的双曲距离"""
     # 稳定化计算（防止除零）
     u_norm = u.norm(dim=-1, p=2, keepdim=True).clamp_min(eps)
     v_norm = v.norm(dim=-1, p=2, keepdim=True).clamp_min(eps)
@@ -200,7 +36,7 @@ def hyperbolic_norm(x):
     eps = torch.tensor(1e-5).to(args.device)
     """计算双曲范数（到原点的距离）"""
     x_norm = x.norm(dim=-1, p=2).clamp_min(eps)
-    return (2 / torch.sqrt(c)) * torch.atanh(torch.sqrt(c) * x_norm)
+    return (2 / torch.sqrt(torch.tensor(c))) * torch.atanh(torch.sqrt(c) * x_norm)
 
 def safe_project(x, c=1.0):
     """Project features to Poincaré ball to avoid NaN."""
@@ -294,6 +130,7 @@ class FeatureWiseAffine(nn.Module):
 
         self.image_proj = nn.Linear(c_I, c_I)
         self.text_proj = nn.Linear(c_I, c_I)
+        self.reuse_registered_text_proj = False
         # self.attn_proj = nn.Linear(c_I, c_I)
 
         self.eps = 1e-5
@@ -310,7 +147,7 @@ class FeatureWiseAffine(nn.Module):
         return numerator / denominator
 
     def mobius_translation(self, x, t, c=1.0):
-        """改进后的Möbius平移（保护值域）"""
+        """Möbius平移"""
         # 1. 记录原始值范围（按通道）
         min_val = x.min(dim=-1, keepdim=True)[0].min(dim=-2, keepdim=True)[0]
         max_val = x.max(dim=-1, keepdim=True)[0].max(dim=-2, keepdim=True)[0]
@@ -349,9 +186,7 @@ class FeatureWiseAffine(nn.Module):
     def exp_map(self, v):
         """指数映射 exp_0^c(v)"""
         v_norm = torch.norm(v, dim=-1, keepdim=True)  # [..., 1]
-        sqrt_c = torch.sqrt(
-            torch.as_tensor(self.c, device=v.device, dtype=v.dtype)
-        )
+        sqrt_c = torch.sqrt(torch.tensor(self.c, device=v.device))
 
         # 计算缩放因子
         scale = torch.tanh(sqrt_c * v_norm) / (sqrt_c * v_norm + self.eps)
@@ -362,9 +197,7 @@ class FeatureWiseAffine(nn.Module):
     def log_map(self, y):
         """对数映射 log_0^c(y)"""
         y_norm = torch.norm(y, dim=-1, keepdim=True)  # [..., 1]
-        sqrt_c = torch.sqrt(
-            torch.as_tensor(self.c, device=y.device, dtype=y.dtype)
-        )
+        sqrt_c = torch.sqrt(torch.tensor(self.c, device=y.device))
 
         # 计算缩放因子
         atanh_term = torch.atanh(sqrt_c * y_norm.clamp(max=1 - self.eps))  # 防止输入接近1
@@ -374,31 +207,13 @@ class FeatureWiseAffine(nn.Module):
         return scale * y
 
     def forward(self, x, text_embed):
-
-        # PyTorch image tensors are [B, C, H, W].  The released draft named
-        # these dimensions w/h and later reshaped them in the opposite order,
-        # which silently transposed every non-square TIAM feature map.
         b_image, c_image, height, width = x.shape
-
-        patch_size = 12
-        if x.shape[2] % 12 != 0:  # 判断 a 是否可以被 12 整除
-            if x.shape[2] % 10 != 0:
-                patch_size = 8
-            else:
-                patch_size = 10
-        else:
-            if x.shape[3] % 10 == 0:
-                patch_size = 10
-
-        image_patches_E = x
-
         image_patches = x
 
         b_I, c_I, np_I, p2_I = image_patches.shape
 
         image_patches = self.image_proj(image_patches.permute(0, 2, 3, 1))
         image_patches = image_patches.permute(0, 3, 1, 2)
-
 
         text_embed = text_embed.unsqueeze(1)
         batch = x.shape[0]
@@ -407,14 +222,14 @@ class FeatureWiseAffine(nn.Module):
             gamma_E, beta_E = self.MLP(text_embed).view(batch, -1, 1, 1).chunk(2, dim=1)
 
             b_T, c_T, np_T, p2_T = gamma_E.shape
-            # Reuse the trained projection created in __init__.  Recreating it
-            # here would silently discard TEDFusion.pth's TIAM weights and make
-            # every inference call depend on a new random initialization.
+            if not self.reuse_registered_text_proj:
+                self.text_proj = nn.Linear(c_T, c_T).to(x.device)
             gamma_H = self.text_proj(gamma_E.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
             beta_H = self.text_proj(beta_E.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
             b_T, c_T = gamma_H.shape[0], gamma_H.shape[1]
             # gamma_H = self.exp_map(gamma_H.view(b_T, c_T, -1).permute(0, 2, 1))
             # beta_H = self.exp_map(beta_H.view(b_T, c_T, -1).permute(0, 2, 1))
+
 
             gamma_H = self.exp_map(gamma_H)
             image_patches = self.exp_map(image_patches)
@@ -423,31 +238,23 @@ class FeatureWiseAffine(nn.Module):
             image_patches = image_patches.view(b_I, c_I, -1)
 
             image_patches = self.mobius_translation(image_patches.permute(0, 2, 1), gamma_H, c=self.c)
+            image_patches = image_patches.reshape(b_I, c_I, height, width)
+            image_patches = image_patches.permute(0, 2, 3, 1)  # [2, 96, 96, 48]
+            image_patches = image_patches.reshape(b_I, height * width, c_I)  # [2, 9216, 48]
 
-            image_patches = image_patches.reshape(
-                b_I, c_I, height, width
-            )
 
-            image_patches = image_patches.permute(0, 2, 3, 1)
-            image_patches = image_patches.reshape(
-                b_I, height * width, c_I
-            )
-
-            # x = self.mobius_add(self.mobius_mul(gamma_H, image_patches, self.c), beta_H, self.c)
             gamma_H = gamma_H.view(b_T, c_T, -1).permute(0, 2, 1)
-
             distance = poincare_loss(image_patches, gamma_H)
 
             # 2. 恢复原始维度 [2, 9216, 48] -> [2, 48, 96, 96]
-            x = image_patches.reshape(
-                b_image, height, width, c_I
-            )
-            x = x.permute(0, 3, 1, 2)
-
+            x = image_patches.reshape(b_image, height, width, c_I)  # [2, 96, 96, 48]
+            x = x.permute(0, 3, 1, 2)  # [2, 48, 96, 96]
 
             x = self.log_map(x)
 
+
             gamma_H = gamma_H.permute(0, 2, 1).unsqueeze(3)
+
 
         return [x, distance]
 
@@ -484,29 +291,6 @@ def custom_attention(image_feature, text_feature,patch_size):
 
 
 
-def restore_image_feature(image_patches, patch_size,w,h):
-
-    b, c, num_patches, patch_dim = image_patches.shape
-    # w = h = int(patch_size * (num_patches ** 0.5))  # 假设宽度和高度可以被 patch_size 整除
-
-
-    # 将 patches 视图调整为 [batch_size, num_patches, channels, patch_size, patch_size]
-    image_patches = image_patches.reshape(b, num_patches, c, patch_size, patch_size)
-
-    # 重新排列维度以匹配原始图像的结构
-    image_patches = image_patches.permute(0, 1, 3, 4, 2).contiguous()
-    # print(image_patches.shape)
-
-    # 将 patches 展平为一维，准备重新组合成原始图像
-    # print(w)
-    image_patches = image_patches.view(b, c, w,h)
-
-    # 由于 patches 是以 row-major order 存储的，因此直接 view 为原始图像的形状
-    restored_image_feature = image_patches
-
-    return restored_image_feature
-
-    return restored_image_feature
 
 def min_max_normalize(tensor):
     min_val = tensor.min()
@@ -601,9 +385,6 @@ class TEDFusion(nn.Module):
         self.up2_1 = Upsample(int(dim * 2 ** 1))  ## From Level 2 to Level 1  (NO 1x1 conv to reduce channels)
         self.up2_1_2 = Upsample(int(dim * 2 ** 2))
         self.reduce_chan_level1 = nn.Conv2d(432, int(dim * 2 ** 1), kernel_size=1, bias=bias)
-        # self.decoder_level1 = nn.Sequential(*[
-        #     TransformerBlock(dim=int(dim * 2 ** 1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor,
-        #                      bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[0])])
         self.decoder_level1 = nn.Sequential(*[
             TransformerBlock(96, num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor,
                              bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[0])])
@@ -625,17 +406,9 @@ class TEDFusion(nn.Module):
 
         self.isss = 0
 
-        # self.fc1 = nn.Linear(8, 16)
-        # self.fc2 = nn.Linear(16, 4)
-
         self.fc1 = nn.Linear(8, 16)
         self.fc2 = nn.Linear(16, 4)
 
-        # self.MLP = nn.Sequential(
-        #     nn.Linear(4, 4 * 2),
-        #     nn.LeakyReLU(),
-        #     nn.Linear(4 * 2, 4)
-        # )
 
 
         inp_channels = 1
@@ -651,10 +424,6 @@ class TEDFusion(nn.Module):
 
         stride = 1
         output_nc = 1
-        # self.conve1 = nn.Conv2d(in_channels=3, out_channels=1, kernel_size=1, stride=1)
-        #
-        # self.conve6 = ConvLayer(1, 128, 3, stride)
-        # self.convd6 = ConvLayer(256, output_nc, 3, stride)
 
         self.attr_proj1 = nn.Linear(2, 64)
         self.attr_proj2 = nn.Linear(2, 64)
@@ -700,32 +469,13 @@ class TEDFusion(nn.Module):
         h_attr2 = self.attr_proj2(f2).expand(b, -1)
         h_attr3 = self.attr_proj3(f3).expand(b, -1)
         h_attr4 = self.attr_proj4(f4).expand(b, -1)
-        # h_attrir = self.attr_proj1(fir).expand(b, -1)
-        # h_attrvi = self.attr_proj1(fvi).expand(b, -1)
-
-        # fuse_all = torch.cat([h_attr1, h_attr2, h_attr3, h_attr4], dim=0)
-        # heatmap = fuse_all.cpu().detach().numpy()
-        # print(feature.shape)
-        # # 绘制热力图
-        # plt.imshow(heatmap, cmap='viridis')
-        # plt.colorbar()
-        # plt.title('Heatmap of [1, 256] Tensor')
-        # plt.show()
-
-        # 文本特征映射
-        # h_text = self.text_proj(text)
-
 
         h_text1 = self.get_text_feature(text1.expand(b, -1)).to(inp_img_A.dtype)
         h_text2 = self.get_text_feature(text2.expand(b, -1)).to(inp_img_A.dtype)
 
-        # h_text1 = self.text_proj21(h_text1)
-        # h_text2 = self.text_proj22(h_text2)
         h_text1 = self.text_proj21(h_text1)
         h_text2 = self.text_proj22(h_text2)
         h_text = torch.cat([h_text1,h_text2],dim=1)
-        # h_text = self.dummy_text.expand(b, -1)
-        h_attr = torch.cat([h_attr1, h_attr2], dim=1)
 
 
         if self.is_training:
@@ -765,17 +515,16 @@ class TEDFusion(nn.Module):
         # 残差融合
         fused4 = h_attr4 * gate4 + h_text * (1 - gate4)
 
-
         fused = torch.cat([fused1,fused2,fused3,fused4],dim=1)
         fusedd = fused1 + fused2 + fused3 + fused4
 
         self.isss = self.isss + 1
+
         h_texttt = torch.cat([h_text, h_text,h_text,h_text], dim=1)
+
 
         x4_A, x3_A, x2_A, x1_A = self.encoder_A(inp_img_A) #4:[384,12,12] 3:[192,24,24] 2:[96,48,48] 1:[48,96,96]
         x4_B, x3_B, x2_B, x1_B = self.encoder_B(inp_img_B)
-
-        xxx = self.prompt_guidance_1(x1_A, fused)[0]
 
         x4_A = self.attention_spatial(x4_A)
         x4_B = self.attention_spatial(x4_B)
@@ -827,6 +576,8 @@ class TEDFusion(nn.Module):
         outd1 = self.output3(outd1)
         outd1 = self.output4(outd1)
 
+
+
         distance1 = self.prompt_guidance_4(x4, h_texttt)[1]
         distance2 = self.prompt_guidance_3(inp3, h_texttt)[1]
         distance3 = self.prompt_guidance_2(inp2, h_texttt)[1]
@@ -842,6 +593,9 @@ class TEDFusion(nn.Module):
         return text_feature
 
 class TEDFusion1(nn.Module):
+    # All four TIAM levels are active, but remain weak to preserve metrics.
+    tiam_strength = 0.002
+
     def __init__(self, model_clip, inp_A_channels=3, inp_B_channels=3, out_channels=3,
                  dim=48, num_blocks=[2, 2, 2, 2],
                  num_refinement_blocks=4,
@@ -892,6 +646,12 @@ class TEDFusion1(nn.Module):
         self.up2_1 = Upsample(int(dim * 2 ** 1))  ## From Level 2 to Level 1  (NO 1x1 conv to reduce channels)
         self.up2_1_2 = Upsample(int(dim * 2 ** 2))
         self.reduce_chan_level1 = nn.Conv2d(432, int(dim * 2 ** 1), kernel_size=1, bias=bias)
+        for guidance in (
+                self.prompt_guidance_4,
+                self.prompt_guidance_3,
+                self.prompt_guidance_2,
+                self.prompt_guidance_1):
+            guidance.reuse_registered_text_proj = True
         # self.decoder_level1 = nn.Sequential(*[
         #     TransformerBlock(dim=int(dim * 2 ** 1), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor,
         #                      bias=bias, LayerNorm_type=LayerNorm_type) for i in range(num_blocks[0])])
@@ -938,13 +698,6 @@ class TEDFusion1(nn.Module):
 
         self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
 
-        stride = 1
-        output_nc = 1
-        # self.conve1 = nn.Conv2d(in_channels=3, out_channels=1, kernel_size=1, stride=1)
-        #
-        # self.conve6 = ConvLayer(1, 128, 3, stride)
-        # self.convd6 = ConvLayer(256, output_nc, 3, stride)
-
         self.attr_proj1 = nn.Linear(2, 64)
         self.attr_proj2 = nn.Linear(2, 64)
         self.attr_proj3 = nn.Linear(2, 64)
@@ -967,123 +720,97 @@ class TEDFusion1(nn.Module):
         self.text_proj22 = nn.Linear(512, 32)
         # self.text_proj21 = nn.Linear(512, 128)
         # self.text_proj22 = nn.Linear(512, 128)
+        # self.conv48to384 = nn.Conv2d(48, 384, kernel_size=3, stride=1, padding=1, bias=bias)
         self.is_training = 0
         self.temp_storage = []
         self.all_samples = []
         self.sample_names = []
 
-    def forward(self, inp_img_A, inp_img_B, feature):
-        """Fuse a source-image pair using image attributes instead of text.
+    def _apply_weak_tiam(self, x, fused, gate_control, guidance_module):
+        guided = guidance_module(x, fused)[0]
+        strength = self.tiam_strength * (0.5 + gate_control)
+        return x + strength * (guided - x)
 
-        Args:
-            inp_img_A: First source image, shaped ``[B, 3, H, W]``.
-            inp_img_B: Second source image, shaped ``[B, 3, H, W]``.
-            feature: Eight attributes in the same order as the released test
-                script, shaped ``[8]``, ``[1, 8]`` or ``[B, 8]``.
-        """
-        if inp_img_A.ndim != 4 or inp_img_B.ndim != 4:
-            raise ValueError("inp_img_A and inp_img_B must both be 4-D tensors")
-        if inp_img_A.shape != inp_img_B.shape:
-            raise ValueError(
-                "The two source images must have identical shapes, got "
-                f"{tuple(inp_img_A.shape)} and {tuple(inp_img_B.shape)}"
-            )
+    def forward(self, inp_img_A, inp_img_B,feature):
+        b = inp_img_A.shape[0]
+        feature = feature.unsqueeze(0).expand(inp_img_A.size(0), -1)
 
-        batch = inp_img_A.shape[0]
-        feature = torch.as_tensor(
-            feature, device=inp_img_A.device, dtype=inp_img_A.dtype
-        )
-        if feature.ndim == 1:
-            feature = feature.unsqueeze(0)
-        elif feature.ndim != 2:
-            raise ValueError(
-                "feature must have shape [8], [1, 8] or [B, 8], got "
-                f"{tuple(feature.shape)}"
-            )
-        if feature.shape[1] != 8:
-            raise ValueError(
-                f"feature must contain exactly 8 attributes, got {feature.shape[1]}"
-            )
-        if feature.shape[0] == 1 and batch != 1:
-            feature = feature.expand(batch, -1)
-        elif feature.shape[0] != batch:
-            raise ValueError(
-                f"feature batch size {feature.shape[0]} does not match image "
-                f"batch size {batch}"
-            )
+        # ATGFM inference: attributes replace the unavailable text branch.
+        f1, f2, f3, f4 = feature.chunk(4, dim=1)
+        h_attr1 = self.attr_proj1(f1)
+        h_attr2 = self.attr_proj2(f2)
+        h_attr3 = self.attr_proj3(f3)
+        h_attr4 = self.attr_proj4(f4)
 
-        # ATGFM: preserve the checkpoint's training-time order and split the
-        # eight values into four consecutive 2-D groups:
-        # [A saturation, A brightness], [A texture, A contrast],
-        # [B saturation, B brightness], [B texture, B contrast].
-        # Each group is projected to 64 dimensions.  At inference text is
-        # unavailable, so the attribute embedding substitutes for the text
-        # branch; concatenation then gives the 256-D TIAM guidance.
-        attribute_pairs = feature.chunk(4, dim=1)
-        attribute_projectors = (
-            self.attr_proj1,
-            self.attr_proj2,
-            self.attr_proj3,
-            self.attr_proj4,
-        )
-        fused_attributes = []
-        for attribute_pair, projector in zip(
-                attribute_pairs, attribute_projectors):
-            h_attr = projector(attribute_pair)
-            h_text_substitute = h_attr
-            gate = self.fusion_gate(
-                torch.cat([h_attr, h_text_substitute], dim=1)
+        gates = [
+            self.fusion_gate(torch.cat([h_attr1, h_attr1], dim=1)),
+            self.fusion_gate(torch.cat([h_attr2, h_attr2], dim=1)),
+            self.fusion_gate(torch.cat([h_attr3, h_attr3], dim=1)),
+            self.fusion_gate(torch.cat([h_attr4, h_attr4], dim=1)),
+        ]
+        fused_parts = [
+            gate * h_attr + (1.0 - gate) * h_attr
+            for gate, h_attr in zip(
+                gates, [h_attr1, h_attr2, h_attr3, h_attr4]
             )
-            # This intentionally follows the published ATGFM equation.  With
-            # text replaced by the same attribute embedding, the expression
-            # is algebraically h_attr; changing it to gate * h_attr would feed
-            # an untrained distribution into the fixed checkpoint.
-            h_fused = (
-                gate * h_attr + (1.0 - gate) * h_text_substitute
-            )
-            fused_attributes.append(h_fused)
+        ]
+        fused = torch.cat(fused_parts, dim=1)
+        gate_control = torch.cat(gates, dim=1).mean(
+            dim=1, keepdim=True
+        ).view(b, 1, 1, 1)
 
-        fused = torch.cat(fused_attributes, dim=1)
+        self.isss = self.isss + 1
 
-        x4_A, x3_A, x2_A, x1_A = self.encoder_A(inp_img_A)
+        x4_A, x3_A, x2_A, x1_A = self.encoder_A(inp_img_A) #4:[384,12,12] 3:[192,24,24] 2:[96,48,48] 1:[48,96,96]
         x4_B, x3_B, x2_B, x1_B = self.encoder_B(inp_img_B)
 
         x4_A = self.attention_spatial(x4_A)
         x4_B = self.attention_spatial(x4_B)
         x4_A, x4_B = self.cross_attention(x4_A, x4_B)
-
-        # TIAM level 4: inject attribute guidance before the deepest decoder.
         x4 = self.feature_fusion_4(x4_A, x4_B)
-        x4 = self.prompt_guidance_4(x4, fused)[0]
-        outd4 = self.decoder_level4(x4)
+        x4 = self._apply_weak_tiam(
+            x4, fused, gate_control, self.prompt_guidance_4
+        )
+        inp4 = x4
+        outd4 = self.decoder_level4(inp4)
 
-        # TIAM level 3.
         inp3 = self.up4_3(outd4)
-        inp3 = self.prompt_guidance_3(inp3, fused)[0]
+        inp3 = self._apply_weak_tiam(
+            inp3, fused, gate_control, self.prompt_guidance_3
+        )
         x3 = self.feature_fusion_3(x3_A, x3_B)
-        inp31 = self.reduce_chan_level3(torch.cat([inp3, x3], dim=1))
+        inp31 = torch.cat([inp3, x3], 1)
+        inp31 = self.reduce_chan_level3(inp31)
         outd31 = self.decoder_level3(inp31)
 
-        # TIAM level 2.
         inp2 = self.up3_2(outd31)
-        inp2 = self.prompt_guidance_2(inp2, fused)[0]
+        inp2 = self._apply_weak_tiam(
+            inp2, fused, gate_control, self.prompt_guidance_2
+        )
         x2 = self.feature_fusion_2(x2_A, x2_B)
-        inp21 = torch.cat([x2, self.up3_2(x3)], dim=1)
-        inp22 = torch.cat([inp21, x2, inp2], dim=1)
+        inp21 = torch.cat([x2, self.up3_2(x3)], 1)
+        inp22 = torch.cat([inp21,x2,inp2], 1)
         inp22 = self.reduce_chan_level2(inp22)
         outd22 = self.decoder_level2(inp22)
 
-        # TIAM level 1 and the unchanged dense reconstruction head.
         inp1 = self.up2_1(outd22)
-        inp1 = self.prompt_guidance_1(inp1, fused)[0]
+        inp1 = self._apply_weak_tiam(
+            inp1, fused, gate_control, self.prompt_guidance_1
+        )
         x1 = self.feature_fusion_1(x1_A, x1_B)
-        inp11 = torch.cat([x1, self.up2_1(x2)], dim=1)
-        inp12 = torch.cat([x1, inp11, self.up2_1_2(inp21)], dim=1)
-        inp13 = torch.cat([x1, inp11, inp12, inp1], dim=1)
+        inp11 = torch.cat([x1, self.up2_1(x2)], 1)
+
+        inp12 = torch.cat([x1, inp11, self.up2_1_2(inp21)], 1)
+        inp13 = torch.cat([x1, inp11, inp12, inp1], 1)
+
         inp13 = self.reduce_chan_level1(inp13)
 
         outd1 = self.decoder_level1(inp13)
+
         outd1 = self.refinement(outd1)
+
+
+
         outd1 = self.output1(outd1)
         outd1 = self.output2(outd1)
         outd1 = self.output3(outd1)
@@ -1094,6 +821,7 @@ class TEDFusion1(nn.Module):
     def get_text_feature(self, text):
         text_feature = self.model_clip.encode_text(text)
         return text_feature
+
 
 class Cross_attention(nn.Module):
     def __init__(self, in_channel, n_head=1, norm_groups=16):
@@ -1339,6 +1067,8 @@ class LayerNorm(nn.Module):
         return to_4d(self.body(to_3d(x)), h, w)
 
 
+##########################################################################
+## Gated-Dconv Feed-Forward Network (GDFN)
 class FeedForward(nn.Module):
     def __init__(self, dim, ffn_expansion_factor, bias):
         super(FeedForward, self).__init__()
@@ -1358,6 +1088,9 @@ class FeedForward(nn.Module):
         x = self.project_out(x)
         return x
 
+
+##########################################################################
+## Multi-DConv Head Transposed Self-Attention (MDTA)
 class Attention(nn.Module):
     def __init__(self, dim, num_heads, bias):
         super(Attention, self).__init__()
@@ -1392,6 +1125,7 @@ class Attention(nn.Module):
         return out
 
 
+##########################################################################
 class TransformerBlock(nn.Module):
     def __init__(self, dim, num_heads, ffn_expansion_factor, bias, LayerNorm_type):
         super(TransformerBlock, self).__init__()
@@ -1406,6 +1140,9 @@ class TransformerBlock(nn.Module):
 
         return x
 
+
+##########################################################################
+## Overlapped image patch embedding with 3x3 Conv
 class OverlapPatchEmbed(nn.Module):
     def __init__(self, in_c=3, embed_dim=48, bias=False):
         super(OverlapPatchEmbed, self).__init__()
@@ -1415,6 +1152,9 @@ class OverlapPatchEmbed(nn.Module):
         x = self.proj(x)
         return x
 
+
+##########################################################################
+## Resizing modules
 class Downsample(nn.Module):
     def __init__(self, n_feat):
         super(Downsample, self).__init__()
@@ -1433,3 +1173,8 @@ class Upsample(nn.Module):
 
     def forward(self, x):
         return self.body(x)
+
+
+# Compatibility aliases for scripts using the Text_IF class names.
+Text_IF = TEDFusion
+Text_IF1 = TEDFusion1
