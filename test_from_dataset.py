@@ -5,7 +5,7 @@ import cv2
 import clip.clip
 import torch
 from torchvision.transforms import functional as F
-from model.TEDFusion_model import TEDFusion1 as create_model
+
 from model.TEDFusion_model import TEDFusion1 as create_model1
 
 
@@ -28,7 +28,7 @@ def set_seed_thread(seed):
     torch.cuda.manual_seed(seed)
 
 def main(args):
-    set_seed_thread(2010)
+    # set_seed_thread(200)
 
     root_path = args.dataset_path
     save_path = args.save_path
@@ -74,19 +74,19 @@ def main(args):
         ir = Image.open(ir_path).convert(mode="RGB")
         vi = Image.open(vi_path).convert(mode="RGB")
 
-        width, height = vi.size
-        assert ir.size == vi.size, "The visible and infrared image sizes do not match: {} vs {}".format(
-            vi.size, ir.size
-        )
+        height, width = vi.size
 
-        # Three PixelUnshuffle stages require a multiple of 8. Reflection padding
-        # preserves the original pixels and avoids nearest-neighbour resize artifacts.
-        pad_right = (-width) % 8
-        pad_bottom = (-height) % 8
-        if pad_right or pad_bottom:
-            padding = [0, 0, pad_right, pad_bottom]
-            ir = F.pad(ir, padding, padding_mode="reflect")
-            vi = F.pad(vi, padding, padding_mode="reflect")
+        new_width = (width // 16) * 16
+
+        new_height = (height // 16) * 16
+
+        # new_width = (width * 16.0) / 16.0
+        #
+        # new_height = (height * 16.0) / 16.0
+
+
+        ir = ir.resize((new_height, new_width))
+        vi = vi.resize((new_height, new_width))
 
         ir = F.to_tensor(ir)
         vi = F.to_tensor(vi)
@@ -136,22 +136,13 @@ def main(args):
         feature = feature.float()
 
         with torch.no_grad():
+            # text = clip.tokenize(text_line).to(device)
+            # text1 = clip.tokenize(text_line[0]).to(device)
+            # text2 = clip.tokenize(text_line[1]).to(device)
+            # text3 = clip.tokenize(text_line[2]).to(device)
+            # text4 = clip.tokenize(text_line[3]).to(device)
+            i = model(vi, ir,feature)
 
-            # The dominant artifact has a 2-pixel phase, so retain all four
-            # parity combinations without increasing inference time.
-            shifts = [(0, 0), (0, 1), (1, 0), (1, 1)]
-            outputs = []
-
-            for dy, dx in shifts:
-                vi_shifted = torch.roll(vi, shifts=(dy, dx), dims=(2, 3))
-                ir_shifted = torch.roll(ir, shifts=(dy, dx), dims=(2, 3))
-                out = model(vi_shifted, ir_shifted, feature)
-                out_unshifted = torch.roll(out, shifts=(-dy, -dx), dims=(2, 3))
-                outputs.append(out_unshifted)
-
-            i = torch.stack(outputs).mean(dim=0)
-            i = i[:, :, :height, :width]
-            # i = model(vi, ir,feature)
             text1 = torch.tensor(0)
             text2 = torch.tensor(0)
             # i = model(vi, ir, feature,text1,text2)
@@ -180,10 +171,10 @@ def mergy_Y_RGB_to_YCbCr(img1, img2):
     return merged_img
 
 def save_pic(outputpic, path, index : str):
-    # Do not stretch every output independently: it amplifies faint periodic
-    # decoder errors in low-light images.
-    outputpic = np.clip(outputpic, 0.0, 1.0)
-    outputpic = np.rint(outputpic * 255.0).astype(np.uint8)
+    outputpic[outputpic > 1.] = 1
+    outputpic[outputpic < 0.] = 0
+    outputpic = cv2.UMat(outputpic).get()
+    outputpic = cv2.normalize(outputpic, None, 0, 255, cv2.NORM_MINMAX, cv2.CV_32F)
     outputpic=outputpic[:, :, ::-1]
     save_path = os.path.join(path, index).replace(".jpg", ".png")
     cv2.imwrite(save_path, outputpic)

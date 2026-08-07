@@ -9,7 +9,7 @@ import clip
 from data.prompt_dataset import PromptDataSet
 from data.simple_dataset import SimpleDataSet
 
-from model.TEDFusion_model import TEDFusion as create_model
+from model.TEDFusion_modelyuanlai import TEDFusion as create_model
 from scripts.utils import read_data, train_one_epoch, evaluate, create_lr_scheduler
 import datetime
 import warnings
