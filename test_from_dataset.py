@@ -5,9 +5,9 @@ import cv2
 import clip.clip
 import torch
 from torchvision.transforms import functional as F
-from model.TEDFusion_model import Text_IF as create_model
-from model.TEDFusion_model import Text_IF1 as create_model1
-# from model.Text_IF_model import Text_IF2 as create_model2
+from model.TEDFusion_model import TEDFusion1 as create_model
+from model.TEDFusion_model import TEDFusion1 as create_model1
+
 
 import argparse
 
@@ -37,7 +37,7 @@ def main(args):
 
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     supported = [".jpg", ".JPG", ".png", ".PNG", ".bmp", 'tif', 'TIF']
-    text_line = args.input_text
+    # text_line = args.input_text
 
     visible_root = os.path.join(root_path, "Visible")
     infrared_root = os.path.join(root_path, "Infrared")
@@ -213,7 +213,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset_path', type=str, required=True, help='test data root path')
     parser.add_argument('--weights_path', type=str, required=True, help='initial weights path')
     parser.add_argument('--save_path', type=str, default='./results', help='output save image path')
-    parser.add_argument('--input_text', type=str, required=True, help='text control input')
+    # parser.add_argument('--input_text', type=str, required=True, help='text control input')
 
     parser.add_argument('--device', default='cuda', help='device (i.e. cuda or cpu)')
     parser.add_argument('--gpu_id', default='0', help='device id (i.e. 0, 1, 2 or 3)')
